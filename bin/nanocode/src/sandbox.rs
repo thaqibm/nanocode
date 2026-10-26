@@ -337,18 +337,20 @@ pub fn unified_diff(old: &Path, new: &Path, label: &str) -> String {
     let text = String::from_utf8_lossy(&output.stdout);
     let old_name = old.to_string_lossy();
     let new_name = new.to_string_lossy();
+    let mut names = [old_name.as_ref(), new_name.as_ref()]
+        .into_iter()
+        .filter(|name| *name != "/dev/null")
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
     text.lines()
         .map(|line| {
             let header = ["diff --git ", "--- ", "+++ ", "Binary files ", "rename "]
                 .iter()
                 .any(|prefix| line.starts_with(prefix));
             if header {
-                [old_name.as_ref(), new_name.as_ref()]
-                    .into_iter()
-                    .filter(|name| *name != "/dev/null")
-                    .fold(line.to_owned(), |line, name| {
-                        line.replace(name.trim_start_matches('/'), label)
-                    })
+                names.iter().fold(line.to_owned(), |line, name| {
+                    line.replace(name.trim_start_matches('/'), label)
+                })
             } else {
                 line.to_owned()
             }
