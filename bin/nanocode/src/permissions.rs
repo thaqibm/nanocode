@@ -44,7 +44,7 @@ impl Mode {
 
     pub const fn icon(self) -> &'static str {
         match self {
-            Self::ReviewEdits => "👤",
+            Self::ReviewEdits => "󰀄",
             _ => "⏵",
         }
     }
