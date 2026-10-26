@@ -281,6 +281,7 @@ async fn prepare(
         permissions: Some(permissions),
         diff_tool: config.diff_tool,
         diff_viewer: config.diff_viewer,
+        computer_use: args.computer_use || config.computer_use,
     };
     let config = host_config;
     let host = tracing::Instrument::instrument(

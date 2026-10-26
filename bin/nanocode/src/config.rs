@@ -16,6 +16,8 @@ pub struct Config {
     pub diff_tool: Option<String>,
     pub diff_viewer: Option<String>,
     #[serde(default)]
+    pub computer_use: bool,
+    #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
 }
 

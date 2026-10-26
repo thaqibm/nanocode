@@ -196,6 +196,12 @@ pub struct SessionArgs {
     #[arg(long, help = "Disable subagent tools")]
     pub no_subagents: bool,
 
+    #[arg(
+        long,
+        help = "Enable computer use (native apps and browser tabs); also computer_use = true in config.toml"
+    )]
+    pub computer_use: bool,
+
     #[command(flatten)]
     pub gateway: GatewayArgs,
 
@@ -254,6 +260,7 @@ impl SessionArgs {
             home: self.home.or(root.home),
             no_mouse: self.no_mouse || root.no_mouse,
             no_subagents: self.no_subagents || root.no_subagents,
+            computer_use: self.computer_use || root.computer_use,
             gateway: GatewayArgs {
                 gateway: self.gateway.gateway.or(root.gateway.gateway),
                 cloudflare_account: self

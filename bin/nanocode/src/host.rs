@@ -236,6 +236,7 @@ pub struct HostConfig {
     pub permissions: Option<std::sync::Arc<crate::permissions::Permissions>>,
     pub diff_tool: Option<String>,
     pub diff_viewer: Option<String>,
+    pub computer_use: bool,
 }
 
 #[derive(Clone)]
@@ -532,6 +533,9 @@ impl Host {
             Some(store) => builder.durability(store.clone()),
             None => builder.durability(nanocode::durability::MemoryStore::new()?),
         };
+        if !config.computer_use {
+            builder = builder.without_cua();
+        }
         if !config.subagents {
             builder = builder.without_subagents();
         }
