@@ -807,7 +807,18 @@ fn footer(app: &App) -> Line<'static> {
     }
     spans.extend([
         Span::styled(
-            format!(" {} ", crate::app::family_label(&app.model.family())),
+            format!(
+                " {} ",
+                app.host
+                    .config
+                    .gateway
+                    .as_ref()
+                    .filter(|gateway| gateway.models().contains(&app.model))
+                    .map_or_else(
+                        || crate::app::family_label(&app.model.family()).to_string(),
+                        |gateway| gateway.name().to_owned()
+                    )
+            ),
             Style::default()
                 .fg(theme.code_background())
                 .bg(theme.accent())
@@ -832,6 +843,7 @@ fn footer(app: &App) -> Line<'static> {
     }
     if let Some(gateway) = &app.host.config.gateway
         && app.model.as_codex().is_some()
+        && !gateway.models().contains(&app.model)
     {
         spans.push(Span::styled(
             format!(" · via {}", gateway.name()),

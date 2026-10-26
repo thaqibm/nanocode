@@ -33,7 +33,15 @@
         providers.baseten = {
           base_url = "https://inference.baseten.co/v1";
           api_key_file = "/run/secrets/baseten";
-          models.kimi-k3 = "moonshotai/Kimi-K3";
+          models = [
+            {
+              name = "baseten/kimi-k3";
+              slug = "moonshotai/Kimi-K3";
+              display = "Kimi K3";
+              thinking = "max";
+              thinking_levels = [ "none" "low" "high" "max" ];
+            }
+          ];
         };
       }
     '';

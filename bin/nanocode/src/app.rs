@@ -2894,10 +2894,10 @@ impl App {
                 let Some(model) = models::model_at(picker, index) else {
                     return;
                 };
-                let thinking = if model.supports_thinking(self.thinking) {
+                let thinking = if crate::host::thinking_levels(&model).contains(&self.thinking) {
                     self.thinking
                 } else {
-                    model.default_thinking()
+                    crate::host::default_thinking(&model)
                 };
                 self.open_dial(model, thinking, true);
             }

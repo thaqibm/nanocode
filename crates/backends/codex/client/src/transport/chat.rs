@@ -270,7 +270,7 @@ impl ChatGateway {
             .and_then(|model| model.parse::<Model>().ok())
             .filter(|model| self.serves_model(*model))
             .ok_or_else(|| reject("unsupported_model", self.served_models()))?;
-        let translation = translate(&body, model)?;
+        let translation = translate(&body, model, self.provider == Provider::Compatible)?;
         let mut chat = translation.chat;
         chat.insert(
             "model".to_owned(),
@@ -815,7 +815,11 @@ const fn vision(model: Model) -> bool {
     !matches!(model, Model::Glm53)
 }
 
-fn effort(model: Model, value: Option<&Value>) -> Result<Option<String>, ResponsesError> {
+fn effort(
+    model: Model,
+    value: Option<&Value>,
+    any: bool,
+) -> Result<Option<String>, ResponsesError> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -824,6 +828,7 @@ fn effort(model: Model, value: Option<&Value>) -> Result<Option<String>, Respons
         .ok_or_else(|| reject("unsupported_reasoning", "reasoning effort must be a string"))?;
 
     let supported = match model {
+        _ if any => !value.is_empty(),
         Model::Kimi => matches!(value, "low" | "high"),
         _ => matches!(value, "low" | "medium" | "high"),
     };
@@ -837,7 +842,7 @@ fn effort(model: Model, value: Option<&Value>) -> Result<Option<String>, Respons
 }
 
 #[allow(clippy::too_many_lines)]
-fn translate(body: &Value, model: Model) -> Result<Translation, ResponsesError> {
+fn translate(body: &Value, model: Model, any_effort: bool) -> Result<Translation, ResponsesError> {
     let body = body
         .as_object()
         .ok_or_else(|| reject("invalid_request", "expected a Responses request object"))?;
@@ -916,7 +921,11 @@ fn translate(body: &Value, model: Model) -> Result<Translation, ResponsesError> 
     let mut pending: HashSet<String> = HashSet::new();
     let mut seen_call_ids: HashSet<String> = HashSet::new();
     let mut answered: HashSet<String> = HashSet::new();
-    let mut reasoning_effort = effort(model, body.get("reasoning").and_then(|r| r.get("effort")))?;
+    let mut reasoning_effort = effort(
+        model,
+        body.get("reasoning").and_then(|r| r.get("effort")),
+        any_effort,
+    )?;
     for item in &history {
         let kind = item
             .get("type")
@@ -926,7 +935,11 @@ fn translate(body: &Value, model: Model) -> Result<Translation, ResponsesError> 
             "additional_tools" => {}
             "configuration_update" => {
                 if let Some(value) =
-                    effort(model, item.get("reasoning").and_then(|r| r.get("effort")))?
+                    effort(
+                        model,
+                        item.get("reasoning").and_then(|r| r.get("effort")),
+                        any_effort,
+                    )?
                 {
                     reasoning_effort = Some(value);
                 }

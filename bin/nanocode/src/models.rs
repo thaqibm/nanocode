@@ -56,14 +56,16 @@ pub fn model_picker(current: &ModelSelection, gateway: Option<&crate::host::Gate
             if gateway.is_some_and(|gateway| !gateway.serves(&model)) {
                 continue;
             }
-            let capabilities = model.capabilities(ModelTransport::Native);
-            let thinking = capabilities
-                .thinking()
+            let thinking = crate::host::thinking_levels(&model)
+                .into_iter()
                 .map(Thinking::as_str)
                 .collect::<Vec<_>>()
                 .join("/");
             let mut item = PickerItem::choice(model.to_string())
-                .detail(format!("{} · thinking {thinking}", model.display_name()))
+                .detail(format!(
+                    "{} · thinking {thinking}",
+                    crate::host::display_name(&model)
+                ))
                 .current(model == *current);
             let features = features(&model);
             if !features.is_empty() {
@@ -83,12 +85,12 @@ pub fn model_at(picker: &Picker, index: usize) -> Option<ModelSelection> {
 }
 
 pub fn thinking_picker(model: &ModelSelection, current: Thinking) -> Picker {
-    let capabilities = model.capabilities(ModelTransport::Native);
-    let items = capabilities
-        .thinking()
+    let default = crate::host::default_thinking(model);
+    let items = crate::host::thinking_levels(model)
+        .into_iter()
         .map(|thinking| {
             let mut item = PickerItem::choice(thinking.as_str()).current(thinking == current);
-            if thinking == capabilities.default_thinking() {
+            if thinking == default {
                 item = item.detail("default");
             }
             item
@@ -99,9 +101,8 @@ pub fn thinking_picker(model: &ModelSelection, current: Thinking) -> Picker {
 
 pub fn thinking_at(model: &ModelSelection, picker: &Picker, index: usize) -> Option<Thinking> {
     let label = &picker.items().get(index)?.label;
-    model
-        .capabilities(ModelTransport::Native)
-        .thinking()
+    crate::host::thinking_levels(model)
+        .into_iter()
         .find(|thinking| thinking.as_str() == label)
 }
 
@@ -147,16 +148,13 @@ pub fn thinking_dial(
     current: Thinking,
     theme: &Theme,
 ) -> Option<(EffortDial, Vec<Thinking>)> {
-    let levels = model
-        .capabilities(ModelTransport::Native)
-        .thinking()
-        .collect::<Vec<_>>();
+    let levels = crate::host::thinking_levels(model);
     let selected = levels
         .iter()
         .position(|level| *level == current)
         .unwrap_or(0);
     let dial = EffortDial::new(
-        format!("Thinking · {}", model.display_name()),
+        format!("Thinking · {}", crate::host::display_name(model)),
         levels
             .iter()
             .map(|level| Level {

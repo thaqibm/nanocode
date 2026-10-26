@@ -259,18 +259,124 @@ enum Route {
     },
 }
 
-static CONFIGURED_MODELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+pub struct ConfiguredModel {
+    name: String,
+    display: Option<String>,
+    thinking: Option<Thinking>,
+    levels: Vec<Thinking>,
+}
 
-pub fn configure_models(models: Vec<String>) {
+static CONFIGURED_MODELS: std::sync::OnceLock<Vec<ConfiguredModel>> = std::sync::OnceLock::new();
+
+pub fn configure_models(config: &crate::config::Config) -> Result<()> {
+    let mut models = Vec::new();
+    for (provider, settings) in &config.providers {
+        for entry in settings.entries() {
+            let context = |error: Error| -> Error {
+                format!("provider {provider} model {}: {error}", entry.name).into()
+            };
+            let thinking = entry
+                .thinking
+                .as_deref()
+                .map(parse_thinking)
+                .transpose()
+                .map_err(context)?;
+            let levels = entry
+                .thinking_levels
+                .iter()
+                .map(|level| parse_thinking(level))
+                .collect::<Result<Vec<_>>>()
+                .map_err(context)?;
+            if let Some(thinking) = thinking
+                && !levels.is_empty()
+                && !levels.contains(&thinking)
+            {
+                return Err(context(
+                    format!("thinking {thinking} is not one of its thinking_levels").into(),
+                ));
+            }
+            models.push(ConfiguredModel {
+                name: entry.name.clone(),
+                display: entry.display.clone(),
+                thinking,
+                levels,
+            });
+        }
+    }
     drop(CONFIGURED_MODELS.set(models));
+    Ok(())
+}
+
+fn configured(model: &ModelSelection) -> Option<&'static ConfiguredModel> {
+    let id = model.as_codex()?.as_str();
+    CONFIGURED_MODELS
+        .get()?
+        .iter()
+        .find(|entry| entry.name == id)
 }
 
 fn configured_model(value: &str) -> Option<ModelSelection> {
     CONFIGURED_MODELS
         .get()?
         .iter()
-        .any(|model| model == value)
+        .any(|model| model.name == value)
         .then(|| value.parse::<Model>().ok().map(ModelSelection::Codex))?
+}
+
+pub fn thinking_levels(model: &ModelSelection) -> Vec<Thinking> {
+    configured(model)
+        .filter(|entry| !entry.levels.is_empty())
+        .map_or_else(
+            || {
+                model
+                    .capabilities(nanocode::ModelTransport::Native)
+                    .thinking()
+                    .collect()
+            },
+            |entry| entry.levels.clone(),
+        )
+}
+
+pub fn configured_thinking(model: &ModelSelection) -> Option<Thinking> {
+    configured(model).and_then(|entry| entry.thinking)
+}
+
+pub fn default_thinking(model: &ModelSelection) -> Thinking {
+    configured(model)
+        .and_then(|entry| entry.thinking)
+        .unwrap_or_else(|| {
+            model
+                .capabilities(nanocode::ModelTransport::Native)
+                .default_thinking()
+        })
+}
+
+pub fn display_name(model: &ModelSelection) -> String {
+    configured(model)
+        .and_then(|entry| entry.display.clone())
+        .unwrap_or_else(|| model.display_name().to_string())
+}
+
+pub fn check_thinking(model: &ModelSelection, thinking: Thinking) -> Result<()> {
+    if configured(model).is_some_and(|entry| !entry.levels.is_empty()) {
+        let levels = thinking_levels(model);
+        return if levels.contains(&thinking) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{model} takes thinking {}",
+                levels
+                    .iter()
+                    .map(|level| level.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into())
+        };
+    }
+    Ok(model
+        .capabilities(nanocode::ModelTransport::Native)
+        .check_thinking(thinking)?)
 }
 
 impl Gateway {
@@ -305,17 +411,22 @@ impl Gateway {
         let (key, credential) = provider.key(name)?;
         let mut gateway =
             nanocode::codex::transport::ChatGateway::openai_compatible(provider.base_url.clone());
-        for (alias, wire) in &provider.models {
-            let model = alias
+        for entry in provider.entries() {
+            let model = entry
+                .name
                 .parse::<Model>()
-                .map_err(|error| format!("provider {name} model {alias:?}: {error}"))?;
-            gateway = gateway.model(model, wire.clone());
+                .map_err(|error| format!("provider {name} model {:?}: {error}", entry.name))?;
+            gateway = gateway.model(model, entry.slug());
         }
         Ok(Self {
             route: Route::Chat {
                 name: name.to_owned(),
                 gateway,
-                models: provider.models.keys().cloned().collect(),
+                models: provider
+                    .entries()
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect(),
             },
             auth: nanocode::codex::OpenAiAuth::api_key(key),
             credential,

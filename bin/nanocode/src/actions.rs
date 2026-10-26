@@ -43,10 +43,11 @@ impl App {
             return;
         }
         let capabilities = model.capabilities(nanocode::ModelTransport::Native);
-        if let Err(error) = capabilities
-            .check_thinking(thinking)
-            .and_then(|()| capabilities.check_service_tier(tier))
-        {
+        if let Err(error) = crate::host::check_thinking(&model, thinking).and_then(|()| {
+            capabilities
+                .check_service_tier(tier)
+                .map_err(crate::host::Error::from)
+        }) {
             self.notice(NoticeLevel::Error, error.to_string());
             return;
         }

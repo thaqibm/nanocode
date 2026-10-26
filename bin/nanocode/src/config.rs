@@ -34,10 +34,50 @@ pub struct Provider {
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
     pub api_key_file: Option<PathBuf>,
-    pub models: BTreeMap<String, String>,
+    pub models: Models,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Models {
+    List(Vec<ModelEntry>),
+    Map(BTreeMap<String, String>),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelEntry {
+    pub name: String,
+    pub slug: Option<String>,
+    pub display: Option<String>,
+    pub thinking: Option<String>,
+    #[serde(default)]
+    pub thinking_levels: Vec<String>,
+}
+
+impl ModelEntry {
+    pub fn slug(&self) -> &str {
+        self.slug.as_deref().unwrap_or(&self.name)
+    }
 }
 
 impl Provider {
+    pub fn entries(&self) -> Vec<ModelEntry> {
+        match &self.models {
+            Models::List(entries) => entries.clone(),
+            Models::Map(map) => map
+                .iter()
+                .map(|(name, slug)| ModelEntry {
+                    name: name.clone(),
+                    slug: Some(slug.clone()),
+                    display: None,
+                    thinking: None,
+                    thinking_levels: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn key(&self, name: &str) -> Result<(String, String)> {
         if let Some(path) = &self.api_key_file {
             let key = std::fs::read_to_string(path)
@@ -84,7 +124,7 @@ impl Config {
         let config: Self =
             toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
         for (name, provider) in &config.providers {
-            if provider.models.is_empty() {
+            if provider.entries().is_empty() {
                 return Err(format!("{}: provider {name} lists no models", path.display()).into());
             }
             let sources = [
@@ -107,7 +147,7 @@ impl Config {
         let model = model.trim();
         self.providers
             .iter()
-            .find(|(_, provider)| provider.models.contains_key(model))
+            .find(|(_, provider)| provider.entries().iter().any(|entry| entry.name == model))
             .map(|(name, provider)| (name.as_str(), provider))
     }
 }

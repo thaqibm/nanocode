@@ -208,13 +208,7 @@ async fn prepare(
     };
     let home = host::home_dir(args.home.as_deref())?;
     let config = config::Config::load(&home)?;
-    host::configure_models(
-        config
-            .providers
-            .values()
-            .flat_map(|provider| provider.models.keys().cloned())
-            .collect(),
-    );
+    host::configure_models(&config)?;
     let requested = args.model.clone().or_else(|| {
         args.harness
             .is_none()
@@ -256,14 +250,20 @@ async fn prepare(
     }
     let defaulted = requested.is_none() && args.harness.is_none();
     let capabilities = model.capabilities(nanocode::ModelTransport::Native);
-    let thinking = match args.thinking.as_ref().or(config.thinking.as_ref()) {
-        Some(value) => host::parse_thinking(value)?,
-        None if defaulted && capabilities.supports_thinking(Thinking::Xhigh) => Thinking::Xhigh,
-        None => model.default_thinking(),
+    let thinking = match (
+        &args.thinking,
+        host::configured_thinking(&model),
+        &config.thinking,
+    ) {
+        (Some(value), _, _) => host::parse_thinking(value)?,
+        (None, Some(thinking), _) => thinking,
+        (None, None, Some(value)) => host::parse_thinking(value)?,
+        (None, None, None) if defaulted && capabilities.supports_thinking(Thinking::Xhigh) => {
+            Thinking::Xhigh
+        }
+        (None, None, None) => model.default_thinking(),
     };
-    model
-        .capabilities(nanocode::ModelTransport::Native)
-        .check_thinking(thinking)?;
+    host::check_thinking(&model, thinking)?;
     let tier = match &args.tier {
         Some(value) => host::parse_tier(value)?,
         None => ServiceTier::Standard,
