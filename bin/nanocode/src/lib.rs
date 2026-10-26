@@ -1,6 +1,7 @@
 #![cfg(not(target_family = "wasm"))]
 
 mod actions;
+mod ansi;
 mod app;
 mod approval;
 mod batch;
@@ -62,7 +63,13 @@ fn install_telemetry(
     let args = &cli.observability;
     let interactive = !matches!(
         cli.command,
-        Some(Command::Exec(_) | Command::Hand(_) | Command::Sessions(_) | Command::Models)
+        Some(
+            Command::Exec(_)
+                | Command::Hand(_)
+                | Command::Sessions(_)
+                | Command::Models
+                | Command::Clean
+        )
     ) && !is_cua(cli);
     let output = match (args.log_filter().is_some(), interactive) {
         (false, _) => nanocode_observability::LogOutput::Disabled,
@@ -155,6 +162,7 @@ pub fn run_with(clients: ModelClients) -> ExitCode {
                 list_sessions(args).await
             }
             Some(Command::Exec(args)) => exec(args.or(cli.session), clients).await,
+            Some(Command::Clean) => clean(&home),
             Some(Command::Models) => {
                 print_models();
                 Ok(())
@@ -665,4 +673,32 @@ async fn answer_in_terminal(
         let approved = matches!(line, Ok(Ok(line)) if line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes"));
         request.answer(approved);
     }
+}
+
+fn clean(home: &Path) -> Result<()> {
+    let config = config::Config::load(home)?;
+    let (removed, live) = sandbox::remove_stale(&[
+        sandbox::base(config.sandbox_dir.as_deref()),
+        std::env::temp_dir(),
+    ]);
+    let mut failed = false;
+    for (path, result) in &removed {
+        match result {
+            Ok(()) => println!("removed {}", path.display()),
+            Err(error) => {
+                failed = true;
+                eprintln!("could not remove {}: {error}", path.display());
+            }
+        }
+    }
+    if removed.is_empty() {
+        println!("nothing to clean");
+    }
+    if live > 0 {
+        println!("kept {live} directories of running sessions");
+    }
+    if failed {
+        return Err("some directories could not be removed".into());
+    }
+    Ok(())
 }

@@ -1,4 +1,7 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use nanocode_tui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -218,15 +221,8 @@ impl App {
             self.flash("there is no diff to show");
             return;
         }
-        let viewer = self
-            .host
-            .config
-            .diff_viewer
-            .clone()
-            .or_else(|| std::env::var("PAGER").ok())
-            .unwrap_or_else(|| "less -R".to_owned());
-        let Some(mut words) = shlex_words(&viewer).filter(|words| !words.is_empty()) else {
-            self.flash(format!("could not parse diff_viewer {viewer:?}"));
+        let Some(mut words) = self.viewer_words() else {
+            self.flash("could not parse diff_viewer");
             return;
         };
         if words[0] == "delta" && !words.iter().any(|word| word.starts_with("--paging")) {
@@ -247,6 +243,53 @@ impl App {
         if let Err(error) = result {
             self.flash(format!("could not run {}: {error}", words[0]));
         }
+    }
+
+    fn viewer_words(&self) -> Option<Vec<String>> {
+        let viewer = self
+            .host
+            .config
+            .diff_viewer
+            .clone()
+            .or_else(|| on_path("delta").then(|| "delta".to_owned()))
+            .or_else(|| std::env::var("PAGER").ok())
+            .unwrap_or_else(|| "less -R".to_owned());
+        shlex_words(&viewer).filter(|words| !words.is_empty())
+    }
+
+    fn preview(&mut self, diff: &str, width: u16) -> Vec<Line<'static>> {
+        use std::hash::{Hash, Hasher};
+        let limit = self.host.config.diff_preview_lines;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        diff.hash(&mut hasher);
+        let key = (hasher.finish(), width);
+        if let Some((cached, lines)) = &self.preview_cache
+            && *cached == key
+        {
+            return lines.clone();
+        }
+        let rendered = self
+            .viewer_words()
+            .filter(|words| {
+                Path::new(&words[0])
+                    .file_name()
+                    .is_some_and(|name| name == "delta")
+            })
+            .and_then(|words| delta(&words, diff, width))
+            .unwrap_or_else(|| nanocode_tui::diff::render(diff, width, &self.theme));
+        let total = rendered.len();
+        let mut lines = rendered.into_iter().take(limit).collect::<Vec<_>>();
+        if total > limit {
+            lines.push(Line::styled(
+                format!(
+                    "… {} more lines · v to view all · d for the diff tool",
+                    total - limit
+                ),
+                Style::default().fg(self.theme.muted()),
+            ));
+        }
+        self.preview_cache = Some((key, lines.clone()));
+        lines
     }
 
     fn diff_pairs(&self, every: bool) -> Vec<(PathBuf, PathBuf)> {
@@ -337,18 +380,41 @@ fn diffs(ledger: &[Recorded], workspace: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn preview(diff: &str, width: u16, limit: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let (mut lines, total) = nanocode_tui::diff::render_rows(diff, width, theme, limit);
-    if total > limit {
-        lines.push(Line::styled(
-            format!(
-                "… {} more lines · v to view all · d for the diff tool",
-                total - limit
-            ),
-            Style::default().fg(theme.muted()),
-        ));
-    }
-    lines
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|directory| directory.join(program).is_file())
+    })
+}
+
+fn delta(words: &[String], diff: &str, width: u16) -> Option<Vec<Line<'static>>> {
+    let mut child = std::process::Command::new(&words[0])
+        .args(
+            words[1..]
+                .iter()
+                .filter(|word| !word.starts_with("--paging")),
+        )
+        .args([
+            "--paging=never",
+            "--hunk-header-style=omit",
+            "--file-decoration-style=none",
+        ])
+        .arg(format!("--width={width}"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = diff.to_owned();
+    let writer = std::thread::spawn(move || drop(stdin.write_all(input.as_bytes())));
+    let output = child.wait_with_output().ok()?;
+    drop(writer.join());
+    output.status.success().then(|| {
+        crate::ansi::lines(&String::from_utf8_lossy(&output.stdout))
+            .into_iter()
+            .filter(|line| line.width() > 0)
+            .collect()
+    })
 }
 
 fn panel(
@@ -381,14 +447,23 @@ fn panel(
 pub(crate) fn render(app: &mut App, area: Rect, frame: &mut Canvas<'_>) {
     app.approvals.retain(|request| !request.is_stale());
     let width = area.width.saturating_sub(2);
-    let limit = app.host.config.diff_preview_lines;
+    let diff = match app.approvals.front() {
+        Some(request) => Some(request.diff.clone()),
+        None => app
+            .review
+            .as_ref()
+            .and_then(|review| review.diffs.get(review.selected).cloned()),
+    };
+    let preview = diff
+        .filter(|diff| !diff.is_empty())
+        .map(|diff| app.preview(&diff, width));
     if let Some(request) = app.approvals.front() {
         let theme = &app.theme;
         let root = app.session_id();
         let mut lines = header(request, root.as_deref(), app.permission_mode(), theme);
-        if !request.diff.is_empty() {
+        if let Some(preview) = preview {
             lines.push(Line::default());
-            lines.extend(preview(&request.diff, width, limit, theme));
+            lines.extend(preview);
         }
         let pending = app.approvals.len();
         let title = if pending > 1 {
@@ -434,13 +509,9 @@ pub(crate) fn render(app: &mut App, area: Rect, frame: &mut Canvas<'_>) {
             Span::styled(label(recorded, workspace), style),
         ]));
     }
-    if let Some(diff) = review
-        .diffs
-        .get(review.selected)
-        .filter(|diff| !diff.is_empty())
-    {
+    if let Some(preview) = preview {
         lines.push(Line::default());
-        lines.extend(preview(diff, width, limit, theme));
+        lines.extend(preview);
     }
     let title = format!("Review · {} changed paths", app.ledger.len());
     panel(area, frame, theme, &title, REVIEW_FOOTER, lines, 0);

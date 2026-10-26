@@ -325,6 +325,7 @@ pub struct App {
     pub(crate) review: Option<crate::approval::Review>,
     pub(crate) review_dismissed: bool,
     pub(crate) pending_diff_tool: bool,
+    pub(crate) preview_cache: Option<((u64, u16), Vec<nanocode_tui::ratatui::text::Line<'static>>)>,
 }
 
 pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
@@ -406,6 +407,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         review: None,
         review_dismissed: false,
         pending_diff_tool: false,
+        preview_cache: None,
     };
     let instance = reload::Instance::start(app.tx.clone()).await?;
     if let Some(state) = launch.reload {

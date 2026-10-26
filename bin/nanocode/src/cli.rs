@@ -35,6 +35,10 @@ pub enum Command {
     Exec(SessionArgs),
     #[command(about = "List models per harness with thinking levels and speed tiers")]
     Models,
+    #[command(
+        about = "Remove sandbox and review directories left behind by nanocode sessions that are no longer running"
+    )]
+    Clean,
     #[command(about = "Resume a saved session; without an id, pick one interactively")]
     Resume {
         #[arg(help = "Session id to resume")]

@@ -61,17 +61,26 @@ impl Recorded {
     pub fn before(&self) -> PathBuf {
         match &self.original {
             Original::File(copy) | Original::Dir(copy) => copy.clone(),
+            Original::Absent if self.path.is_dir() => empty_dir(),
             Original::Absent | Original::Symlink(_) => PathBuf::from("/dev/null"),
         }
     }
 
     pub fn after(&self) -> PathBuf {
-        if std::fs::symlink_metadata(&self.path).is_ok() {
-            self.path.clone()
-        } else {
-            PathBuf::from("/dev/null")
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(_) => self.path.clone(),
+            Err(_) if matches!(self.original, Original::Dir(_)) => empty_dir(),
+            Err(_) => PathBuf::from("/dev/null"),
         }
     }
+}
+
+fn empty_dir() -> PathBuf {
+    let path = std::env::temp_dir()
+        .join(format!("nanocode-review-{}", std::process::id()))
+        .join("empty");
+    drop(std::fs::create_dir_all(&path));
+    path
 }
 
 pub fn snapshot(path: &Path, store: &Path) -> io::Result<Original> {
