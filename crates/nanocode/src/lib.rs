@@ -47,6 +47,8 @@ pub use nanocode_code_mode::remote::{
     RemoteTransport, ResumedReply,
 };
 pub use nanocode_code_mode::tool;
+#[cfg(not(target_family = "wasm"))]
+pub use nanocode_tool_runtime::ToolWrapper;
 pub use nanocode_tool_runtime::{
     Failure, FunctionHandler, FunctionTool, ToolRecovery, Tools, TypedHandler,
 };

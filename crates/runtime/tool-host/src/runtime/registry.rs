@@ -28,14 +28,8 @@ impl RoutingCatalog<'_> {
         &self.registry.providers
     }
 
-    pub fn wrap(&mut self, mut wrap: impl FnMut(&Arc<dyn Tool>) -> Option<Arc<dyn Tool>>) {
-        let registry = &mut *self.registry;
-        for (index, tool) in registry.ordered.iter_mut().enumerate() {
-            if let Some(wrapped) = wrap(tool) {
-                *tool = wrapped;
-                registry.definitions[index] = tool.definition();
-            }
-        }
+    pub fn wrap(&mut self, wrap: impl FnMut(&Arc<dyn Tool>) -> Option<Arc<dyn Tool>>) {
+        self.registry.wrap_tools(wrap);
     }
 
     #[must_use]
@@ -66,6 +60,18 @@ pub(crate) struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub(crate) fn wrap_tools(
+        &mut self,
+        mut wrap: impl FnMut(&Arc<dyn Tool>) -> Option<Arc<dyn Tool>>,
+    ) {
+        for (index, tool) in self.ordered.iter_mut().enumerate() {
+            if let Some(wrapped) = wrap(tool) {
+                *tool = wrapped;
+                self.definitions[index] = tool.definition();
+            }
+        }
+    }
+
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.get(name).is_some()
             || (!host_owned_name(name)

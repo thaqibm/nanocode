@@ -233,21 +233,91 @@ pub struct HostConfig {
     pub gateway: Option<Gateway>,
     pub clients: ModelClients,
     pub headless: bool,
+    pub permissions: Option<std::sync::Arc<crate::permissions::Permissions>>,
+    pub diff_tool: Option<String>,
+    pub diff_viewer: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct Gateway {
-    route: nanocode::codex::transport::ResponsesGateway,
+    route: Route,
     auth: nanocode::codex::OpenAiAuth,
-    credential: &'static str,
+    credential: String,
     base_url: String,
+}
+
+#[derive(Clone)]
+enum Route {
+    Responses(nanocode::codex::transport::ResponsesGateway),
+    Chat {
+        name: String,
+        gateway: nanocode::codex::transport::ChatGateway,
+        models: Vec<String>,
+    },
+}
+
+static CONFIGURED_MODELS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+pub fn configure_models(models: Vec<String>) {
+    drop(CONFIGURED_MODELS.set(models));
+}
+
+fn configured_model(value: &str) -> Option<ModelSelection> {
+    CONFIGURED_MODELS
+        .get()?
+        .iter()
+        .any(|model| model == value)
+        .then(|| value.parse::<Model>().ok().map(ModelSelection::Codex))?
 }
 
 impl Gateway {
     pub fn serves(&self, model: &ModelSelection) -> bool {
-        model
-            .as_codex()
-            .is_none_or(|model| self.route.serves(model))
+        model.as_codex().is_none_or(|model| match &self.route {
+            Route::Responses(route) => route.serves(model),
+            Route::Chat { models, .. } => models
+                .iter()
+                .any(|served| served.parse::<Model>().is_ok_and(|served| served == model)),
+        })
+    }
+
+    pub fn models(&self) -> Vec<ModelSelection> {
+        match &self.route {
+            Route::Responses(_) => Vec::new(),
+            Route::Chat { models, .. } => models
+                .iter()
+                .filter_map(|model| model.parse::<Model>().ok().map(ModelSelection::Codex))
+                .collect(),
+        }
+    }
+
+    pub fn builder(&self) -> nanocode::codex::OpenAiBuilder {
+        let builder = OpenAi::builder(self.auth.clone());
+        match &self.route {
+            Route::Responses(route) => builder.responses_gateway(route.clone()),
+            Route::Chat { gateway, .. } => builder.chat_gateway(gateway.clone()),
+        }
+    }
+
+    pub fn provider(name: &str, provider: &crate::config::Provider) -> Result<Self> {
+        let (key, credential) = provider.key(name)?;
+        let mut gateway =
+            nanocode::codex::transport::ChatGateway::openai_compatible(provider.base_url.clone());
+        for (alias, wire) in &provider.models {
+            let model = alias
+                .parse::<Model>()
+                .map_err(|error| format!("provider {name} model {alias:?}: {error}"))?;
+            gateway = gateway.model(model, wire.clone());
+        }
+        Ok(Self {
+            route: Route::Chat {
+                name: name.to_owned(),
+                gateway,
+                models: provider.models.keys().cloned().collect(),
+            },
+            auth: nanocode::codex::OpenAiAuth::api_key(key),
+            credential,
+            base_url: provider.base_url.clone(),
+        })
     }
 
     pub fn check(&self, model: &ModelSelection) -> Result<()> {
@@ -255,29 +325,38 @@ impl Gateway {
             return Ok(());
         }
         let served = ModelSelection::for_family(nanocode::HarnessFamily::Codex)
+            .chain(self.models())
             .filter(|candidate| self.serves(candidate))
             .map(|candidate| candidate.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!(
             "{model} is not available through the {} gateway; choose one of {served} or a Claude model",
-            self.route.name()
+            self.name()
         )
         .into())
     }
 
-    pub const fn name(&self) -> &'static str {
-        self.route.name()
+    pub fn name(&self) -> &str {
+        match &self.route {
+            Route::Responses(route) => route.name(),
+            Route::Chat { name, .. } => name,
+        }
     }
 
     pub fn compacts(&self, model: &ModelSelection) -> bool {
-        model.as_codex().is_none() || self.route.supports_inline_compaction()
+        match &self.route {
+            Route::Responses(route) => {
+                model.as_codex().is_none() || route.supports_inline_compaction()
+            }
+            Route::Chat { .. } => true,
+        }
     }
 
     pub fn describe(&self) -> String {
         format!(
             "Codex via {} {} · credential {}",
-            self.route.name(),
+            self.name(),
             self.base_url,
             self.credential
         )
@@ -375,9 +454,9 @@ pub fn gateway(args: &GatewayArgs) -> Result<Option<Gateway>> {
     }
     let base_url = route.api_base_url().to_owned();
     Ok(Some(Gateway {
-        route,
+        route: Route::Responses(route),
         auth,
-        credential,
+        credential: credential.to_owned(),
         base_url,
     }))
 }
@@ -407,7 +486,7 @@ impl Host {
             (Some(openai), _) => openai(),
             (None, Some(gateway)) => {
                 gateway.check(model)?;
-                OpenAi::builder(gateway.auth.clone()).responses_gateway(gateway.route.clone())
+                gateway.builder()
             }
             (None, None) => OpenAi::builder(nanocode::codex::OpenAiAuth::chatgpt()),
         }
@@ -438,6 +517,10 @@ impl Host {
                 )
                 .build()?;
             builder = builder.tool_provider(mcp);
+        }
+        if let Some(permissions) = &config.permissions {
+            builder =
+                builder.tool_wrapper(crate::permissions::Gate(std::sync::Arc::clone(permissions)));
         }
         for runner in &config.runners {
             builder = builder.runner(runner.clone());
@@ -517,6 +600,9 @@ impl Host {
 
 pub fn parse_model(value: &str) -> Result<ModelSelection> {
     let value = value.trim();
+    if let Some(model) = configured_model(value) {
+        return Ok(model);
+    }
     if let Some(model) = Model::known(value) {
         return Ok(ModelSelection::Codex(model));
     }

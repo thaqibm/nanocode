@@ -37,8 +37,21 @@ pub fn features(model: &ModelSelection) -> String {
 
 pub fn model_picker(current: &ModelSelection, gateway: Option<&crate::host::Gateway>) -> Picker {
     let mut items = Vec::new();
-    for (family, models) in catalog() {
-        items.push(PickerItem::header(harness_title(&family)));
+    let mut sections = catalog()
+        .into_iter()
+        .map(|(family, models)| (harness_title(&family), models))
+        .collect::<Vec<_>>();
+    if let Some(gateway) = gateway.filter(|gateway| !gateway.models().is_empty()) {
+        sections.insert(0, (gateway.name().to_owned(), gateway.models()));
+    }
+    for (title, models) in sections {
+        if models
+            .iter()
+            .all(|model| gateway.is_some_and(|gateway| !gateway.serves(model)))
+        {
+            continue;
+        }
+        items.push(PickerItem::header(title));
         for model in models {
             if gateway.is_some_and(|gateway| !gateway.serves(&model)) {
                 continue;

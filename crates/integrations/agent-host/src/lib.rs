@@ -46,6 +46,8 @@ pub struct Defaults<C, A> {
     servers: Vec<RunnerServerConfig>,
     #[cfg(not(target_family = "wasm"))]
     tool_environment: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    #[cfg(not(target_family = "wasm"))]
+    tool_wrappers: Vec<Arc<dyn nanocode_tool_host::ToolWrapper>>,
 }
 
 impl<C, A> Default for Defaults<C, A> {
@@ -68,6 +70,8 @@ impl<C, A> Default for Defaults<C, A> {
             servers: Vec::new(),
             #[cfg(not(target_family = "wasm"))]
             tool_environment: Vec::new(),
+            #[cfg(not(target_family = "wasm"))]
+            tool_wrappers: Vec::new(),
         }
     }
 }
@@ -82,6 +86,8 @@ pub struct Services {
     runners_disabled: bool,
     #[cfg(not(target_family = "wasm"))]
     processes: nanocode_process::NativeProcessExecutors,
+    #[cfg(not(target_family = "wasm"))]
+    tool_wrappers: Vec<Arc<dyn nanocode_tool_host::ToolWrapper>>,
 }
 
 impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Defaults<C, A> {
@@ -171,6 +177,7 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> RuntimeDefaults for Def
                 processes: nanocode_process::NativeProcessExecutors::with_environment(
                     self.tool_environment,
                 ),
+                tool_wrappers: self.tool_wrappers,
             }))
         }
         #[cfg(target_family = "wasm")]
@@ -220,6 +227,9 @@ impl<C: DefaultRuntimeBackend, A: DefaultRuntimeBackend> NativeDefaults for Defa
     fn tool_environment(&mut self, environment: Vec<(std::ffi::OsString, std::ffi::OsString)>) {
         self.tool_environment.extend(environment);
     }
+    fn tool_wrapper(&mut self, wrapper: Arc<dyn nanocode_tool_host::ToolWrapper>) {
+        self.tool_wrappers.push(wrapper);
+    }
 }
 
 impl HostServices for Services {
@@ -252,6 +262,10 @@ impl HostServices for Services {
         tools: Tools,
         store: Option<SharedStore>,
     ) -> std::result::Result<Tools, ToolsBuildError> {
+        #[cfg(not(target_family = "wasm"))]
+        let tools = self.tool_wrappers.iter().fold(tools, |tools, wrapper| {
+            tools.with_tool_wrapper(Arc::clone(wrapper))
+        });
         #[cfg(not(target_family = "wasm"))]
         {
             self.agents

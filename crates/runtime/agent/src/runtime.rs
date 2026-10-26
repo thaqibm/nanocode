@@ -558,6 +558,11 @@ impl<B, D: NativeDefaults> RuntimeBuilder<B, D> {
         self
     }
     #[must_use]
+    pub fn tool_wrapper(mut self, wrapper: impl nanocode_tool_host::ToolWrapper) -> Self {
+        self.defaults.tool_wrapper(Arc::new(wrapper));
+        self
+    }
+    #[must_use]
     pub fn tool_provider(
         mut self,
         provider: impl nanocode_tool_host::runtime::DynamicToolProvider + 'static,

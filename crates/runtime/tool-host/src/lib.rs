@@ -20,6 +20,11 @@ pub trait ToolRecovery: Send + Sync + 'static {
     ) -> embedded::HostFuture<'a, Option<nanocode_tools::ToolOutput>>;
 }
 
+#[cfg(not(target_family = "wasm"))]
+pub trait ToolWrapper: Send + Sync + 'static {
+    fn wrap(&self, tool: &std::sync::Arc<dyn Tool>) -> Option<std::sync::Arc<dyn Tool>>;
+}
+
 pub use function_tool::{Failure, FunctionHandler, FunctionTool, MaybeSend, TypedHandler};
 mod policy;
 mod selection;

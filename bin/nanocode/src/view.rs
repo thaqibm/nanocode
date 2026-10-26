@@ -20,7 +20,11 @@ use crate::app::{App, Overlay, TurnState};
 
 pub const STATUS_VISIBLE: Duration = Duration::from_secs(4);
 
-pub const BINDINGS: [Binding; 35] = [
+pub const BINDINGS: [Binding; 36] = [
+    Binding {
+        keys: "shift+tab",
+        action: "cycle permissions: manual, edit perms, edit access, auto",
+    },
     Binding {
         keys: "enter",
         action: "send · steer into the running turn",
@@ -138,7 +142,7 @@ pub const BINDINGS: [Binding; 35] = [
         action: "side pane: a forked side thread beside the chat",
     },
     Binding {
-        keys: "shift+tab · tab · click",
+        keys: "tab · click",
         action: "switch chat and side pane; tab takes back queued messages first",
     },
     Binding {
@@ -369,6 +373,7 @@ pub fn draw(app: &mut App, frame: &mut Canvas<'_>) {
         Some(Overlay::Dial { dial, .. }) => dial.render(area, frame.buffer_mut(), &theme),
         None => frame.selectable(inner),
     }
+    crate::approval::render(app, area, frame);
     let buffer = frame.buffer_mut();
     animation.cells.retain(|position| {
         buffer
@@ -787,7 +792,20 @@ fn status_line(app: &App, now: Instant, animation: &mut Animation) -> Line<'stat
 fn footer(app: &App) -> Line<'static> {
     let _span = tracing::info_span!(target: TUI_TARGET, "nc.footer.render").entered();
     let theme = &app.theme;
-    let mut spans = vec![
+    let mut spans = Vec::new();
+    if let Some(mode) = app.permission_mode() {
+        let color = match mode {
+            crate::permissions::Mode::Auto => theme.thinking_max(),
+            crate::permissions::Mode::EditAccess => theme.thinking_high(),
+            crate::permissions::Mode::EditPerms => theme.thinking_medium(),
+            crate::permissions::Mode::Manual => theme.thinking_low(),
+        };
+        spans.push(Span::styled(
+            format!(" ⏵ {} ", mode.label()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend([
         Span::styled(
             format!(" {} ", crate::app::family_label(&app.model.family())),
             Style::default()
@@ -805,7 +823,7 @@ fn footer(app: &App) -> Line<'static> {
             format!(" · {}", app.thinking),
             Style::default().fg(theme.muted()),
         ),
-    ];
+    ]);
     if app.tier != nanocode::ServiceTier::Standard {
         spans.push(Span::styled(
             format!(" · {}", app.tier.as_str()),

@@ -176,6 +176,7 @@ syn = { version = "2.0.119", features = ["full"] }
 thiserror = "2.0.17"
 tempfile = "3.27.0"
 tokio = "1.48.0"
+toml = { version = "0.9.12", default-features = false, features = ["parse", "serde", "std"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tokio-rustls = { version = "0.26.4", default-features = false }

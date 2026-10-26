@@ -156,6 +156,7 @@ pub trait NativeDefaults: RuntimeDefaults {
     type RunnerServerConfig;
     fn computer(&mut self, computer: Option<Self::Computer>);
     fn tool_environment(&mut self, environment: Vec<(std::ffi::OsString, std::ffi::OsString)>);
+    fn tool_wrapper(&mut self, wrapper: Arc<dyn nanocode_tool_host::ToolWrapper>);
     fn runner_management(&mut self, enabled: bool);
     fn without_runners(&mut self) {}
     fn runner(&mut self, runner: Self::Runner);

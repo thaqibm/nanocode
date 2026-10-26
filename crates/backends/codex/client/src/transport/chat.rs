@@ -49,12 +49,14 @@ pub struct ChatGateway {
     api_base_url: Arc<str>,
     stall_timeout: Duration,
     wire_model: Option<Arc<str>>,
+    models: Arc<[(Model, Arc<str>)]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Provider {
     OpenRouter,
     WorkersAi,
+    Compatible,
 }
 
 impl ChatGateway {
@@ -64,6 +66,7 @@ impl ChatGateway {
             provider: Provider::OpenRouter,
             api_base_url: Arc::from(OPENROUTER_API_BASE_URL),
             wire_model: None,
+            models: Arc::from([]),
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         }
     }
@@ -77,8 +80,33 @@ impl ChatGateway {
                 account_id.into().trim()
             )),
             wire_model: None,
+            models: Arc::from([]),
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         }
+    }
+
+    #[must_use]
+    pub fn openai_compatible(api_base_url: impl Into<String>) -> Self {
+        Self {
+            provider: Provider::Compatible,
+            api_base_url: Arc::from(api_base_url.into().trim().trim_end_matches('/')),
+            wire_model: None,
+            models: Arc::from([]),
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
+        }
+    }
+
+    #[must_use]
+    pub fn model(mut self, model: Model, wire_model: impl Into<String>) -> Self {
+        let mut models = self
+            .models
+            .iter()
+            .filter(|(existing, _)| *existing != model)
+            .cloned()
+            .collect::<Vec<_>>();
+        models.push((model, Arc::from(wire_model.into().trim())));
+        self.models = Arc::from(models);
+        self
     }
 
     #[must_use]
@@ -98,20 +126,22 @@ impl ChatGateway {
     }
 
     pub(crate) fn wire_model_is_valid(&self) -> bool {
-        self.wire_model
-            .as_deref()
-            .is_none_or(|model| match self.provider {
-                Provider::OpenRouter => Self::is_valid_wire_model(model),
-                Provider::WorkersAi => model
-                    .strip_prefix(WORKERS_AI_MODEL_PREFIX)
-                    .is_some_and(Self::is_valid_wire_model),
-            })
+        let valid = |model: &str| match self.provider {
+            Provider::OpenRouter => Self::is_valid_wire_model(model),
+            Provider::WorkersAi => model
+                .strip_prefix(WORKERS_AI_MODEL_PREFIX)
+                .is_some_and(Self::is_valid_wire_model),
+            Provider::Compatible => !model.is_empty(),
+        };
+        self.wire_model.as_deref().is_none_or(valid)
+            && self.models.iter().all(|(_, model)| valid(model))
     }
 
     pub(crate) const fn wire_model_rule(&self) -> &'static str {
         match self.provider {
             Provider::OpenRouter => "the gateway model ID must be an OpenRouter vendor/model slug",
             Provider::WorkersAi => "the gateway model ID must be a Workers AI @cf/vendor/model ID",
+            Provider::Compatible => "the gateway model ID must not be empty",
         }
     }
 
@@ -162,6 +192,7 @@ impl ChatGateway {
         match self.provider {
             Provider::OpenRouter => "openrouter",
             Provider::WorkersAi => "workers-ai",
+            Provider::Compatible => "openai-compatible",
         }
     }
 
@@ -180,10 +211,15 @@ impl ChatGateway {
     }
 
     #[must_use]
-    pub const fn serves_model(&self, model: Model) -> bool {
+    pub fn serves_model(&self, model: Model) -> bool {
         match self.provider {
             Provider::OpenRouter => Self::serves(model),
             Provider::WorkersAi => matches!(model, Model::Glm53 | Model::Custom(_)),
+            Provider::Compatible => {
+                self.wire_model.is_some()
+                    || model.is_custom()
+                    || self.models.iter().any(|(served, _)| *served == model)
+            }
         }
     }
 
@@ -193,12 +229,16 @@ impl ChatGateway {
                 "this gateway serves GLM-5.3, GPT-6 Astra, Kimi K3 and MiMo only"
             }
             Provider::WorkersAi => "Workers AI serves GLM-5.3 only",
+            Provider::Compatible => "this gateway serves only the models configured for it",
         }
     }
 
     fn wire_model_for(&self, model: Model) -> &str {
         if let Some(model) = self.wire_model.as_deref() {
             return model;
+        }
+        if let Some((_, wire)) = self.models.iter().find(|(served, _)| *served == model) {
+            return wire;
         }
         match (self.provider, model) {
             (Provider::OpenRouter, Model::Kimi) => "moonshotai/kimi-k3",
@@ -207,6 +247,7 @@ impl ChatGateway {
             (_, Model::Custom(model)) => model.as_str(),
             (Provider::OpenRouter, _) => "z-ai/glm-5.3",
             (Provider::WorkersAi, _) => "@cf/zai-org/glm-5.3",
+            (Provider::Compatible, model) => model.as_str(),
         }
     }
 
@@ -341,7 +382,7 @@ impl ChatGateway {
 
     fn apply_provider_fields(&self, chat: &mut Map<String, Value>, model: Model) {
         match self.provider {
-            Provider::WorkersAi => {}
+            Provider::WorkersAi | Provider::Compatible => {}
             Provider::OpenRouter => {
                 if matches!(model, Model::Kimi | Model::Mimo)
                     && let Some(tokens) = chat.remove("max_completion_tokens")

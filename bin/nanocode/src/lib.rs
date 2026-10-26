@@ -2,8 +2,10 @@
 
 mod actions;
 mod app;
+mod approval;
 mod cli;
 mod commands;
+mod config;
 #[cfg(unix)]
 mod cua;
 mod events;
@@ -13,6 +15,8 @@ mod history;
 mod host;
 mod login;
 mod models;
+mod permissions;
+mod sandbox;
 mod sessions;
 mod side;
 mod split;
@@ -178,6 +182,7 @@ struct Prepared {
     thinking: Thinking,
     tier: ServiceTier,
     home: PathBuf,
+    approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Request>,
 }
 
 async fn prepare(
@@ -192,11 +197,34 @@ async fn prepare(
         None => std::env::current_dir()?,
     };
     let home = host::home_dir(args.home.as_deref())?;
-    let gateway = host::gateway(&args.gateway)?;
+    let config = config::Config::load(&home)?;
+    host::configure_models(
+        config
+            .providers
+            .values()
+            .flat_map(|provider| provider.models.keys().cloned())
+            .collect(),
+    );
+    let requested = args.model.clone().or_else(|| {
+        args.harness
+            .is_none()
+            .then(|| config.model.clone())
+            .flatten()
+    });
+    let gateway = match (
+        host::gateway(&args.gateway)?,
+        requested
+            .as_deref()
+            .and_then(|model| config.provider_for(model)),
+    ) {
+        (Some(gateway), _) => Some(gateway),
+        (None, Some((name, provider))) => Some(host::Gateway::provider(name, provider)?),
+        (None, None) => None,
+    };
     if gateway.is_some() && clients.supplies_openai() {
         return Err("this binary supplies its own Codex client; --gateway is unavailable".into());
     }
-    let model = match (&args.model, args.harness) {
+    let model = match (&requested, args.harness) {
         (Some(model), harness) => {
             let model = host::parse_model(model)?;
             if let Some(harness) = harness
@@ -216,9 +244,9 @@ async fn prepare(
     if let Some(gateway) = &gateway {
         gateway.check(&model)?;
     }
-    let defaulted = args.model.is_none() && args.harness.is_none();
+    let defaulted = requested.is_none() && args.harness.is_none();
     let capabilities = model.capabilities(nanocode::ModelTransport::Native);
-    let thinking = match &args.thinking {
+    let thinking = match args.thinking.as_ref().or(config.thinking.as_ref()) {
         Some(value) => host::parse_thinking(value)?,
         None if defaulted && capabilities.supports_thinking(Thinking::Xhigh) => Thinking::Xhigh,
         None => model.default_thinking(),
@@ -239,7 +267,9 @@ async fn prepare(
         Some(host::open_store(&home).await?)
     };
     let (runners, runner_servers) = host::runner_configs(&args.remote)?;
-    let config = HostConfig {
+    let mode = config.permissions.unwrap_or_default();
+    let (permissions, approvals) = permissions::Permissions::new(mode, workspace.clone(), &home)?;
+    let host_config = HostConfig {
         workspace,
         store,
         subagents: !args.no_subagents,
@@ -248,7 +278,11 @@ async fn prepare(
         gateway,
         clients,
         headless,
+        permissions: Some(permissions),
+        diff_tool: config.diff_tool,
+        diff_viewer: config.diff_viewer,
     };
+    let config = host_config;
     let host = tracing::Instrument::instrument(
         Host::build(config, &model, thinking),
         tracing::info_span!(target: "nanocode", "nc.host.build"),
@@ -272,6 +306,7 @@ async fn prepare(
         thinking,
         tier,
         home,
+        approvals,
     })
 }
 
@@ -336,7 +371,8 @@ async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()>
         drop(terminal);
         return Err("--resume and --continue require durability; remove --ephemeral".into());
     }
-    app::run(
+    let permissions = prepared.host.config.permissions.clone();
+    let outcome = app::run(
         app::Launch {
             host: prepared.host,
             model: prepared.model,
@@ -345,6 +381,7 @@ async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()>
             resume,
             pick_session,
             prompt: args.prompt,
+            approvals: Some(prepared.approvals),
             history_path: Some(prepared.home.join("history.jsonl")),
             home: prepared.home.clone(),
             thinking_override: args
@@ -358,7 +395,11 @@ async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()>
         },
         terminal,
     )
-    .await
+    .await;
+    if let Some(permissions) = permissions {
+        permissions.cleanup();
+    }
+    outcome
 }
 
 async fn latest_session(host: &Host) -> Result<String> {
@@ -395,6 +436,7 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
     )
     .await?;
     let host = prepared.host;
+    tokio::spawn(answer_in_terminal(prepared.approvals));
     let resume = match (&args.resume, args.continue_last) {
         (Some(id), _) if !id.is_empty() => Some(id.clone()),
         (_, true) => Some(latest_session(&host).await?),
@@ -455,6 +497,9 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
     drop(writeln!(stderr, "session {}", agent.session_id()));
     let flushed = agent.flush().await;
     let shutdown = host.runtime.shutdown().await;
+    if let Some(permissions) = &host.config.permissions {
+        permissions.cleanup();
+    }
     outcome?;
     flushed?;
     shutdown?;
@@ -569,4 +614,37 @@ async fn hand(args: HandArgs) -> Result<()> {
         signal = tokio::signal::ctrl_c() => signal?,
     }
     Ok(())
+}
+
+async fn answer_in_terminal(
+    mut approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Request>,
+) {
+    while let Some(mut request) = approvals.recv().await {
+        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+        let mut stderr = std::io::stderr();
+        drop(writeln!(stderr, "\n{}: {}", request.title, request.detail));
+        if !request.diff.is_empty() {
+            drop(writeln!(stderr, "{}", request.diff));
+        }
+        for path in &request.elsewhere {
+            drop(writeln!(stderr, "  also changes {path}"));
+        }
+        if !interactive {
+            drop(writeln!(
+                stderr,
+                "denied: no terminal to ask for permission"
+            ));
+            request.answer(false);
+            continue;
+        }
+        drop(write!(stderr, "Approve? [y/N] "));
+        drop(stderr.flush());
+        let line = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).map(|_| line)
+        })
+        .await;
+        let approved = matches!(line, Ok(Ok(line)) if line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes"));
+        request.answer(approved);
+    }
 }

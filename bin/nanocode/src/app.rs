@@ -139,6 +139,7 @@ pub enum AppEvent {
         root: String,
         result: std::result::Result<String, String>,
     },
+    Approval(Box<crate::permissions::Request>),
     Notice(NoticeLevel, String),
     Applied(std::result::Result<(ModelSelection, Thinking, ServiceTier, String), String>),
 }
@@ -147,6 +148,7 @@ impl AppEvent {
     const fn kind(&self) -> &'static str {
         match self {
             Self::Reload => "reload",
+            Self::Approval(_) => "approval",
             Self::Agent { .. } => "agent",
             Self::TurnStarted { .. } => "turn_started",
             Self::RoutedTurn { .. } => "routed_turn",
@@ -249,6 +251,7 @@ pub struct Launch {
     pub tier_override: Option<ServiceTier>,
     pub reload: Option<reload::State>,
     pub reload_path: Option<PathBuf>,
+    pub approvals: Option<UnboundedReceiver<crate::permissions::Request>>,
 }
 
 pub struct App {
@@ -314,6 +317,8 @@ pub struct App {
     pub(crate) focus: Option<nanocode::subagents::AgentId>,
     pub(crate) views: HashMap<nanocode::subagents::AgentId, crate::focus::SubagentView>,
     pub(crate) panes: crate::side::Panes,
+    pub(crate) approvals: std::collections::VecDeque<crate::permissions::Request>,
+    pub(crate) approval_scroll: usize,
 }
 
 pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
@@ -389,6 +394,8 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         focus: None,
         views: HashMap::new(),
         panes: crate::side::Panes::default(),
+        approvals: std::collections::VecDeque::new(),
+        approval_scroll: 0,
     };
     let instance = reload::Instance::start(app.tx.clone()).await?;
     if let Some(state) = launch.reload {
@@ -403,6 +410,9 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
     }
     if let Some(updates) = app.host.runtime.take_subagent_updates() {
         forward_subagents(updates, app.tx.clone());
+    }
+    if let Some(approvals) = launch.approvals {
+        forward_approvals(approvals, app.tx.clone());
     }
     if let Some(prompt) = launch
         .prompt
@@ -682,6 +692,19 @@ fn forward_notices(mut notices: crate::host::Notices, tx: UnboundedSender<AppEve
     });
 }
 
+fn forward_approvals(
+    mut approvals: UnboundedReceiver<crate::permissions::Request>,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(request) = approvals.recv().await {
+            if tx.send(AppEvent::Approval(Box::new(request))).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn forward_subagents(mut updates: nanocode::SubagentUpdates, tx: UnboundedSender<AppEvent>) {
     tokio::spawn(async move {
         while let Some(update) = updates.recv().await {
@@ -932,6 +955,13 @@ impl App {
         match event {
             AppEvent::Reload => {
                 self.request_reload(false);
+                Redraw::Immediate
+            }
+            AppEvent::Approval(request) => {
+                if self.approvals.is_empty() {
+                    self.approval_scroll = 0;
+                }
+                self.approvals.push_back(*request);
                 Redraw::Immediate
             }
             AppEvent::Agent { generation, event } => {
@@ -1986,6 +2016,13 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent, terminal: &mut TerminalSession) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if key.code == KeyCode::BackTab {
+            self.cycle_permissions();
+            return;
+        }
+        if self.approval_key(key, terminal) {
+            return;
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return;
@@ -2109,11 +2146,6 @@ impl App {
                 self.recall_queued();
             }
             KeyCode::Tab if self.panes.side.is_some() && self.composer.is_empty() => {
-                self.toggle_pane();
-            }
-            KeyCode::BackTab
-                if self.panes.side.is_some() && !self.composer.text().starts_with('/') =>
-            {
                 self.toggle_pane();
             }
             KeyCode::Tab
@@ -3064,7 +3096,7 @@ pub fn family_label(family: &HarnessFamily) -> &'static str {
     }
 }
 
-fn shlex_words(command: &str) -> Option<Vec<String>> {
+pub(crate) fn shlex_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;

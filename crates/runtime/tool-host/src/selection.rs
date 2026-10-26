@@ -104,6 +104,8 @@ pub struct Tools {
     pub(crate) hand_calls: Option<Arc<dyn crate::embedded::HandCalls>>,
     #[cfg(not(target_family = "wasm"))]
     pub(super) deferred_tools_guidance_enabled: bool,
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) tool_wrappers: Vec<Arc<dyn crate::ToolWrapper>>,
 
     pub(crate) embedded_host: Option<Arc<dyn crate::embedded::CodeModeHost>>,
 
@@ -157,6 +159,8 @@ impl Default for Tools {
             hand_calls: None,
             #[cfg(not(target_family = "wasm"))]
             deferred_tools_guidance_enabled: false,
+            #[cfg(not(target_family = "wasm"))]
+            tool_wrappers: Vec::new(),
 
             embedded_host: None,
 
@@ -344,6 +348,19 @@ impl Tools {
     #[cfg(not(target_family = "wasm"))]
     pub fn with_default_process_route_store(mut self, store: Arc<dyn ProcessRouteStore>) -> Self {
         self.process_route_store.get_or_insert(store);
+        self
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn with_tool_wrapper(mut self, wrapper: Arc<dyn crate::ToolWrapper>) -> Self {
+        if !self
+            .tool_wrappers
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, &wrapper))
+        {
+            self.tool_wrappers.push(wrapper);
+        }
         self
     }
 
