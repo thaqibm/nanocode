@@ -28,18 +28,31 @@ const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 pub enum Mode {
     Manual,
     #[default]
-    EditPerms,
+    #[serde(alias = "edit-perms")]
+    ReviewEdits,
     EditAccess,
     Auto,
 }
 
 impl Mode {
-    pub const ALL: [Self; 4] = [Self::Manual, Self::EditPerms, Self::EditAccess, Self::Auto];
+    pub const ALL: [Self; 4] = [
+        Self::Manual,
+        Self::ReviewEdits,
+        Self::EditAccess,
+        Self::Auto,
+    ];
+
+    pub const fn icon(self) -> &'static str {
+        match self {
+            Self::ReviewEdits => "👤",
+            _ => "⏵",
+        }
+    }
 
     pub const fn label(self) -> &'static str {
         match self {
             Self::Manual => "manual",
-            Self::EditPerms => "edit perms",
+            Self::ReviewEdits => "review edits",
             Self::EditAccess => "edit access",
             Self::Auto => "auto",
         }
@@ -48,7 +61,7 @@ impl Mode {
     pub const fn describe(self) -> &'static str {
         match self {
             Self::Manual => "asks before every command and file change",
-            Self::EditPerms => "asks with a diff before anything changes files in the repo",
+            Self::ReviewEdits => "asks with a diff before anything changes files in the repo",
             Self::EditAccess => "file edits apply; commands that change the repo ask with a diff",
             Self::Auto => "runs everything without asking",
         }
@@ -62,7 +75,7 @@ impl Mode {
     const fn index(self) -> u8 {
         match self {
             Self::Manual => 0,
-            Self::EditPerms => 1,
+            Self::ReviewEdits => 1,
             Self::EditAccess => 2,
             Self::Auto => 3,
         }
@@ -71,7 +84,7 @@ impl Mode {
     const fn from_index(index: u8) -> Self {
         match index {
             0 => Self::Manual,
-            1 => Self::EditPerms,
+            1 => Self::ReviewEdits,
             2 => Self::EditAccess,
             _ => Self::Auto,
         }

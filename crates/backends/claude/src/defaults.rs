@@ -108,6 +108,7 @@ pub fn install_default_tools_with_executor(
         executor,
         &[],
         false,
+        &[],
     )
 }
 
@@ -122,6 +123,7 @@ pub(crate) fn install_default_tools_with_providers(
     executor: Arc<dyn nanocode_process_contracts::ForegroundExecutor>,
     providers: &[Arc<dyn nanocode_tool_host::runtime::DynamicToolProvider>],
     headless: bool,
+    wrappers: &[Arc<dyn nanocode_tool_host::ToolWrapper>],
 ) -> Result<crate::ClaudeTools> {
     let jobs = Arc::new(crate::claude_bash::Jobs::default());
     let selected = match selected {
@@ -143,6 +145,9 @@ pub(crate) fn install_default_tools_with_providers(
             .map_err(|error| NanocodeError::InvalidRequest(error.to_string()))?
         }
     };
+    let selected = wrappers.iter().fold(selected, |selected, wrapper| {
+        selected.with_tool_wrapper(Arc::clone(wrapper))
+    });
     let selected = if selected.has_code_mode_host() {
         selected
     } else {

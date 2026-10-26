@@ -290,6 +290,10 @@ impl HostServices for Services {
     }
 
     #[cfg(not(target_family = "wasm"))]
+    fn tool_wrappers(&self) -> Vec<Arc<dyn nanocode_tool_host::ToolWrapper>> {
+        self.tool_wrappers.clone()
+    }
+    #[cfg(not(target_family = "wasm"))]
     fn runner_routing(&self) -> Option<nanocode_tool_host::attachment::RunnerRouting> {
         (!self.runners_disabled).then(|| self.pool.clone().into())
     }

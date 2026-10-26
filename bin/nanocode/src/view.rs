@@ -23,7 +23,7 @@ pub const STATUS_VISIBLE: Duration = Duration::from_secs(4);
 pub const BINDINGS: [Binding; 36] = [
     Binding {
         keys: "shift+tab",
-        action: "cycle permissions: manual, edit perms, edit access, auto",
+        action: "cycle permissions: manual, review edits, edit access, auto",
     },
     Binding {
         keys: "enter",
@@ -797,11 +797,11 @@ fn footer(app: &App) -> Line<'static> {
         let color = match mode {
             crate::permissions::Mode::Auto => theme.thinking_max(),
             crate::permissions::Mode::EditAccess => theme.thinking_high(),
-            crate::permissions::Mode::EditPerms => theme.thinking_medium(),
+            crate::permissions::Mode::ReviewEdits => theme.thinking_medium(),
             crate::permissions::Mode::Manual => theme.thinking_low(),
         };
         spans.push(Span::styled(
-            format!(" ⏵ {} ", mode.label()),
+            format!(" {} {} ", mode.icon(), mode.label()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
     }

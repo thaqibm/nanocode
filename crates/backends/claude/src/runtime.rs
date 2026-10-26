@@ -197,6 +197,7 @@ impl RuntimeBackend for ClaudeHarness {
                         services.process_executors().foreground(),
                         &providers,
                         headless,
+                        &services.tool_wrappers(),
                     )
                 }
                 #[cfg(target_family = "wasm")]

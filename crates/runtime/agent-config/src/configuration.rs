@@ -110,6 +110,10 @@ pub trait HostServices: Send + Sync + 'static {
     #[cfg(not(target_family = "wasm"))]
     fn process_executors(&self) -> Arc<dyn nanocode_process_contracts::ProcessExecutors>;
     #[cfg(not(target_family = "wasm"))]
+    fn tool_wrappers(&self) -> Vec<Arc<dyn nanocode_tool_host::ToolWrapper>> {
+        Vec::new()
+    }
+    #[cfg(not(target_family = "wasm"))]
     fn runner_routing(&self) -> Option<nanocode_tool_host::attachment::RunnerRouting>;
     #[cfg(not(target_family = "wasm"))]
     fn process_routes(
