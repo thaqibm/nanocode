@@ -33,11 +33,21 @@ pub struct Provider {
     pub base_url: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
+    pub api_key_file: Option<PathBuf>,
     pub models: BTreeMap<String, String>,
 }
 
 impl Provider {
     pub fn key(&self, name: &str) -> Result<(String, String)> {
+        if let Some(path) = &self.api_key_file {
+            let key = std::fs::read_to_string(path)
+                .map_err(|error| format!("provider {name}: {}: {error}", path.display()))?;
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(format!("provider {name}: {} is empty", path.display()).into());
+            }
+            return Ok((key.to_owned(), path.display().to_string()));
+        }
         if let Some(variable) = &self.api_key_env {
             return std::env::var(variable)
                 .ok()
@@ -49,13 +59,17 @@ impl Provider {
             .clone()
             .filter(|key| !key.trim().is_empty())
             .map(|key| (key, "config api_key".to_owned()))
-            .ok_or_else(|| format!("provider {name} needs api_key or api_key_env").into())
+            .ok_or_else(|| {
+                format!("provider {name} needs api_key, api_key_env or api_key_file").into()
+            })
     }
 }
 
 impl Config {
     pub fn path(home: &Path) -> PathBuf {
-        home.join("config.toml")
+        std::env::var_os("NANOCODE_CONFIG")
+            .filter(|path| !path.is_empty())
+            .map_or_else(|| home.join("config.toml"), PathBuf::from)
     }
 
     pub fn load(home: &Path) -> Result<Self> {
@@ -73,9 +87,14 @@ impl Config {
             if provider.models.is_empty() {
                 return Err(format!("{}: provider {name} lists no models", path.display()).into());
             }
-            if provider.api_key.is_some() && provider.api_key_env.is_some() {
+            let sources = [
+                provider.api_key.is_some(),
+                provider.api_key_env.is_some(),
+                provider.api_key_file.is_some(),
+            ];
+            if sources.into_iter().filter(|set| *set).count() > 1 {
                 return Err(format!(
-                    "{}: provider {name} sets both api_key and api_key_env",
+                    "{}: provider {name} sets more than one of api_key, api_key_env and api_key_file",
                     path.display()
                 )
                 .into());
