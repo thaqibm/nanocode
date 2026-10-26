@@ -5,8 +5,8 @@ use std::ops::DerefMut;
 use nanocode_durability_core::{
     Sql, SqlDialect, SqlRow, SqlStatement, SqlStore, StagedWrites, StoreError, StoreFuture,
 };
+use nanocode_sync::Owned;
 use sqlx::{PgConnection, PgPool, Postgres, Row, pool::PoolConnection};
-use tokio::sync::Mutex;
 
 pub trait PgConnections: Send + Sync {
     type Connection: DerefMut<Target = PgConnection> + Send;
@@ -53,12 +53,12 @@ impl<C: PgConnections> Sql for SqlxSql<C> {
     }
 }
 
-pub struct SqlxTransaction<'c>(Mutex<&'c mut PgConnection>);
+pub struct SqlxTransaction<'c>(Owned<&'c mut PgConnection>);
 
 impl<'c> SqlxTransaction<'c> {
     #[must_use]
     pub fn new(connection: &'c mut PgConnection) -> Self {
-        Self(Mutex::new(connection))
+        Self(Owned::new(connection))
     }
 }
 
@@ -68,7 +68,7 @@ impl Sql for SqlxTransaction<'_> {
         _operation: &'static str,
         statements: &'a [SqlStatement<'a>],
     ) -> StoreFuture<'a, Result<Vec<Vec<SqlRow>>, StoreError>> {
-        Box::pin(async move { run(&mut **self.0.lock().await, statements).await })
+        Box::pin(async move { run(&mut **self.0.acquire().await, statements).await })
     }
 
     fn dialect(&self) -> SqlDialect {
@@ -81,7 +81,16 @@ pub async fn commit_staged(
     connection: &mut PgConnection,
 ) -> Result<(), StoreError> {
     writes
-        .commit_to(&mut SqlStore::new(SqlxTransaction::new(connection)))
+        .commit_to(&mut SqlStore::new(SqlxTransaction::new(connection)).migrated())
+        .await
+}
+
+pub async fn stage_records(
+    writes: &StagedWrites,
+    connection: &mut PgConnection,
+) -> Result<(), StoreError> {
+    writes
+        .stage_records(&mut SqlStore::new(SqlxTransaction::new(connection)).migrated())
         .await
 }
 

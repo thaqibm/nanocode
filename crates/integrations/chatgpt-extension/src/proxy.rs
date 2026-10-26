@@ -19,10 +19,14 @@ use std::{
 };
 
 const RESPONSES: usize = 256;
+/// Frames waiting for the stdout writer before senders block, so a browser
+/// that stops reading pushes back on OpenAI's host instead of growing memory;
+/// the stdout writes the proxy replaces were synchronous.
+const OUTGOING: usize = 64;
 
 pub(crate) struct Extension {
     responses: mpsc::Receiver<Value>,
-    output: mpsc::Sender<Vec<u8>>,
+    output: mpsc::SyncSender<Vec<u8>>,
     connected: Arc<AtomicBool>,
     upstream: Option<Child>,
     prefix: String,
@@ -32,7 +36,7 @@ pub(crate) struct Extension {
 impl Extension {
     fn start(original: Option<&Path>, args: &[String], namespace: &str) -> Result<Self, Error> {
         let (sender, responses) = mpsc::sync_channel(RESPONSES);
-        let (output, outgoing) = mpsc::channel::<Vec<u8>>();
+        let (output, outgoing) = mpsc::sync_channel::<Vec<u8>>(OUTGOING);
         let connected = Arc::new(AtomicBool::new(true));
         let prefix = random_prefix(namespace)?;
         let own_prefix = prefix.clone();
@@ -129,10 +133,28 @@ impl Extension {
         self.next += 1;
         let id = format!("{}{}", self.prefix, self.next);
         let body = frame(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        self.output
-            .send(body)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "extension disconnected"))?;
         let deadline = Instant::now() + Duration::from_secs(15);
+        // The output channel is bounded: wait for room only until the deadline.
+        let mut body = body;
+        loop {
+            match self.output.try_send(body) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    body = returned;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    return Err(format!("{method}: the browser is not reading").into());
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "extension disconnected",
+                    )
+                    .into());
+                }
+            }
+        }
         loop {
             let reply = self
                 .responses

@@ -21,15 +21,32 @@ pub enum HandEndpoint {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum HandEvent {
-    Connecting { endpoint: String },
-    Connected { endpoint: String },
-    Listening { endpoint: String },
-    BrainConnected { peer: SocketAddr },
-    Disconnected { reason: String },
-    Retrying { delay: Duration },
+    Connecting {
+        endpoint: String,
+    },
+    Connected {
+        endpoint: String,
+    },
+    Listening {
+        endpoint: String,
+    },
+    BrainConnected {
+        peer: SocketAddr,
+    },
+    Disconnected {
+        reason: String,
+    },
+    Retrying {
+        delay: Duration,
+    },
     Revoked,
     Replaced,
-    Rejected { status: u16 },
+    /// The brain refused the hand for good: `status` is the HTTP status of a
+    /// refused upgrade (401, 403, 410 or 426). `Hand::run` returns an error
+    /// after it.
+    Rejected {
+        status: u16,
+    },
 }
 
 pub struct Hand {
@@ -149,7 +166,7 @@ impl Hand {
                 None => Self::machine_name()?,
             };
             crate::attachment::RemoteRunner::new(&name).map_err(error)?;
-            let options = ExecutorOptions {
+            let mut options = ExecutorOptions {
                 name: Some(name),
                 runtime_id: Some(uuid::Uuid::new_v4().to_string()),
                 callback_timeout: None,
@@ -162,8 +179,12 @@ impl Hand {
                         .map_err(error)?;
                     let headers = request_headers(&self.headers)?;
                     let mut backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
-                    let mut executor =
-                        Executor::new(directory, self.tools, options, self.activity.clone());
+                    let mut executor = Executor::new(
+                        directory.clone(),
+                        self.tools.clone(),
+                        options.clone(),
+                        self.activity.clone(),
+                    );
                     loop {
                         let endpoint = target.endpoint().to_string();
                         events(HandEvent::Connecting {
@@ -171,12 +192,15 @@ impl Hand {
                         });
                         match dial(&target, &headers, policy).await {
                             Ok(socket) => {
-                                events(HandEvent::Connected { endpoint });
                                 let started = Instant::now();
-                                match serve(socket, &mut executor, policy).await {
-                                    Ok(()) => events(HandEvent::Disconnected {
-                                        reason: "the brain closed the connection".into(),
-                                    }),
+                                // Connected only once the brain serves the socket: it may
+                                // still refuse this runtime after the upgrade.
+                                let served = serve(socket, &mut executor, policy, || {
+                                    events(HandEvent::Connected { endpoint });
+                                })
+                                .await;
+                                let mut fenced = false;
+                                match served.result {
                                     Err(issue)
                                         if issue.message()
                                             == nanocode_tool_host::attachment::ATTACHMENT_REVOKED_REASON =>
@@ -190,12 +214,38 @@ impl Hand {
                                         events(HandEvent::Replaced);
                                         return Ok(());
                                     }
+                                    result if served.close_code == Some(POLICY_CLOSE) => {
+                                        executor.reset().await;
+                                        options.runtime_id = Some(uuid::Uuid::new_v4().to_string());
+                                        executor = Executor::new(
+                                            directory.clone(),
+                                            self.tools.clone(),
+                                            options.clone(),
+                                            self.activity.clone(),
+                                        );
+                                        fenced = true;
+                                        let reason = result.err().map_or_else(
+                                            || "no reason".to_owned(),
+                                            |issue| issue.message().to_owned(),
+                                        );
+                                        events(HandEvent::Disconnected {
+                                            reason: format!(
+                                                "the brain fenced this runtime with a policy close (1008): {reason}; reconnecting as a new runtime"
+                                            ),
+                                        });
+                                    }
+                                    Ok(()) => events(HandEvent::Disconnected {
+                                        reason: "the brain closed the connection".into(),
+                                    }),
                                     Err(issue) => events(HandEvent::Disconnected {
                                         reason: issue.to_string(),
                                     }),
                                 }
                                 if started.elapsed() >= crate::attachment::STABLE_CONNECTION {
                                     backoff = crate::attachment::INITIAL_TRANSPORT_BACKOFF;
+                                }
+                                if fenced {
+                                    backoff = crate::attachment::MAX_TRANSPORT_BACKOFF;
                                 }
                             }
                             Err(Dial::Rejected(issue, status)) => {
@@ -258,6 +308,8 @@ impl Hand {
 }
 
 const MAX_NAME_BYTES: usize = 48;
+/// WebSocket close code 1008 (policy violation, RFC 6455 section 7.4.1).
+const POLICY_CLOSE: u16 = 1008;
 
 #[cfg(unix)]
 fn host_name() -> Result<String, CodeModeHostError> {

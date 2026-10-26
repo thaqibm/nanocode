@@ -3356,6 +3356,7 @@ dependencies = [
  "base64 0.22.1",
  "base64-simd",
  "nanocode-platform",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "rquickjs",
  "serde",
@@ -3377,6 +3378,7 @@ dependencies = [
  "libc",
  "nanocode-mcp",
  "nanocode-mcp-tools",
+ "nanocode-sync",
  "nanocode-tool-contracts",
  "nanocode-types",
  "serde",
@@ -3406,6 +3408,7 @@ dependencies = [
  "nanocode-agent-core",
  "nanocode-durability-core",
  "nanocode-platform",
+ "nanocode-sync",
  "serde",
  "serde_json",
  "tokio",
@@ -3420,6 +3423,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "nanocode-platform",
+ "nanocode-sync",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3651,6 +3655,7 @@ name = "nanocode-store-postgres"
 version = "0.6.7"
 dependencies = [
  "nanocode-durability-core",
+ "nanocode-sync",
  "tokio",
  "tokio-postgres",
 ]
@@ -3669,8 +3674,8 @@ name = "nanocode-store-sqlx"
 version = "0.6.7"
 dependencies = [
  "nanocode-durability-core",
+ "nanocode-sync",
  "sqlx",
- "tokio",
 ]
 
 [[package]]

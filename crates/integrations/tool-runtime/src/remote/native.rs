@@ -11,14 +11,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError, Weak,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use nanocode_process::LastActivity;
-use nanocode_sync::{Atom, Owned, Slot};
+use nanocode_sync::{Atom, Owned, Signal, Slot};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -98,7 +98,7 @@ struct ActivityShared {
     draining: AtomicBool,
     busy: watch::Sender<usize>,
     tools: Vec<Weak<dyn Tool>>,
-    boards: Atom<Vec<Arc<Atom<Board>>>>,
+    boards: Atom<Vec<Arc<Board>>>,
 }
 
 impl Default for HandActivity {
@@ -132,7 +132,7 @@ impl HandActivity {
     pub fn items(&self) -> Vec<BusyItem> {
         let mut items = Vec::new();
         for board in self.shared.boards.get().iter() {
-            board.read(|board| board.items(&mut items));
+            board.items(&mut items);
         }
         for tool in self.shared.tools.iter().filter_map(Weak::upgrade) {
             items.extend(
@@ -165,15 +165,15 @@ impl HandActivity {
         self.shared.draining.load(Ordering::Acquire)
     }
 
-    fn attach(&self) -> Arc<Atom<Board>> {
-        let board = Arc::<Atom<Board>>::default();
+    fn attach(&self) -> Arc<Board> {
+        let board = Arc::<Board>::default();
         self.shared
             .boards
             .update(|boards| boards.push(Arc::clone(&board)));
         board
     }
 
-    fn detach(&self, board: &Arc<Atom<Board>>) {
+    fn detach(&self, board: &Arc<Board>) {
         self.shared
             .boards
             .update(|boards| boards.retain(|other| !Arc::ptr_eq(other, board)));
@@ -254,6 +254,12 @@ struct Liveness {
     origin: tokio::time::Instant,
     last_inbound_us: AtomicU64,
     probe_us: AtomicU64,
+    /// Fired by the first text frame or ping from the peer: a pong may answer
+    /// our own ping before the peer took the connection, but a peer only
+    /// sends frames or pings once it serves the socket.
+    heard: Signal,
+    /// The code of the peer's close frame, 0 before one arrives.
+    close_code: AtomicU16,
 }
 
 impl Liveness {
@@ -262,7 +268,12 @@ impl Liveness {
             origin: tokio::time::Instant::now(),
             last_inbound_us: AtomicU64::new(0),
             probe_us: AtomicU64::new(0),
+            heard: Signal::new(),
+            close_code: AtomicU16::new(0),
         })
+    }
+    fn close_code(&self) -> Option<u16> {
+        Some(self.close_code.load(Ordering::Relaxed)).filter(|code| *code != 0)
     }
     fn elapsed_us(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
@@ -461,14 +472,23 @@ async fn read<S: Stream<Item = Result<Message, tungstenite::Error>> + Unpin>(
         let message = message.map_err(error)?;
         liveness.touch();
         match message {
-            Message::Text(text) => return serde_json::from_str(&text).map(Some).map_err(error),
+            Message::Text(text) => {
+                liveness.heard.fire();
+                return serde_json::from_str(&text).map(Some).map_err(error);
+            }
             Message::Close(frame) => {
+                if let Some(frame) = &frame {
+                    liveness
+                        .close_code
+                        .store(u16::from(frame.code), Ordering::Relaxed);
+                }
                 return match frame.filter(|frame| !frame.reason.is_empty()) {
                     Some(frame) => Err(error(frame.reason.as_str())),
                     None => Ok(None),
                 };
             }
-            Message::Ping(_) | Message::Pong(_) => {}
+            Message::Ping(_) => liveness.heard.fire(),
+            Message::Pong(_) => {}
             _ => return Err(error("remote code mode requires JSON text frames")),
         }
     }
@@ -812,16 +832,22 @@ const CALLBACK_DROPPED: &str = "the hand's connection to its brain dropped while
 struct Outgoing {
     wire: Arc<Atom<Option<mpsc::UnboundedSender<String>>>>,
     limit: Arc<AtomicUsize>,
-    backlog: Arc<Mutex<VecDeque<String>>>,
+    backlog: Arc<Atom<VecDeque<Arc<str>>>>,
+    flushing: Arc<AtomicBool>,
+    resumed: Arc<AtomicBool>,
 }
 
 impl Outgoing {
-    fn backlog(&self) -> MutexGuard<'_, VecDeque<String>> {
-        self.backlog.lock().unwrap_or_else(PoisonError::into_inner)
+    fn connect(&self, wire: mpsc::UnboundedSender<String>) {
+        self.resumed.store(false, Ordering::SeqCst);
+        self.wire.set(Some(wire));
+    }
+    fn clear_backlog(&self) {
+        self.backlog.set(VecDeque::new());
     }
     fn queue(&self, text: String) {
-        let mut backlog = self.backlog();
-        let text = if backlog.is_empty() {
+        let text = if self.backlog.read(VecDeque::is_empty) && !self.flushing.load(Ordering::SeqCst)
+        {
             match self.offer(text) {
                 Ok(()) => return,
                 Err((text, _)) => text,
@@ -829,20 +855,49 @@ impl Outgoing {
         } else {
             text
         };
-        if backlog.len() >= MAX_BUFFERED_FRAMES {
-            backlog.pop_front();
+        let text = Arc::<str>::from(text);
+        self.backlog.update(|backlog| {
+            if backlog.len() >= MAX_BUFFERED_FRAMES {
+                backlog.pop_front();
+            }
+            backlog.push_back(Arc::clone(&text));
+        });
+        if self.resumed.load(Ordering::SeqCst) && self.claim() {
+            let _ = self.drain();
         }
-        backlog.push_back(text);
+    }
+    fn claim(&self) -> bool {
+        self.flushing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
     fn flush(&self) -> Result<(), CodeModeHostError> {
-        let mut backlog = self.backlog();
-        while let Some(text) = backlog.pop_front() {
-            if let Err((text, issue)) = self.offer(text) {
-                backlog.push_front(text);
-                return Err(issue);
+        self.resumed.store(true, Ordering::SeqCst);
+        if self.claim() { self.drain() } else { Ok(()) }
+    }
+    fn drain(&self) -> Result<(), CodeModeHostError> {
+        loop {
+            let mut frames = self.backlog.update(std::mem::take).into_iter();
+            while let Some(text) = frames.next() {
+                if let Err((_, issue)) = self.offer(text.to_string()) {
+                    let unsent = std::iter::once(text).chain(frames).collect::<VecDeque<_>>();
+                    self.backlog.update(|backlog| {
+                        let mut held = unsent.clone();
+                        held.extend(backlog.iter().cloned());
+                        while held.len() > MAX_BUFFERED_FRAMES {
+                            held.pop_front();
+                        }
+                        *backlog = held;
+                    });
+                    self.flushing.store(false, Ordering::SeqCst);
+                    return Err(issue);
+                }
+            }
+            self.flushing.store(false, Ordering::SeqCst);
+            if self.backlog.read(VecDeque::is_empty) || !self.claim() {
+                return Ok(());
             }
         }
-        Ok(())
     }
     fn encode(&self, frame: &Frame) -> Result<String, CodeModeHostError> {
         frame.encode(self.limit.load(Ordering::Relaxed))
@@ -1183,6 +1238,7 @@ impl Tool for CallbackTool {
             context,
             hand: None,
             compact: true,
+            output_prefix: true,
         })
         .await
     }
@@ -1215,6 +1271,7 @@ impl HandCalls for HandCallbacks {
                 context,
                 hand: Some(hand.into()),
                 compact: true,
+                output_prefix: true,
             })
             .await
             .unwrap_or_else(|error| ToolOutput::error(error.to_string()))
@@ -1488,9 +1545,9 @@ async fn serve_once<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     activity: HandActivity,
 ) -> Result<(), CodeModeHostError> {
     let mut executor = Executor::new(workspace.to_owned(), tools, options, activity);
-    let result = serve(socket, &mut executor, policy).await;
+    let served = serve(socket, &mut executor, policy, || {}).await;
     executor.reset().await;
-    result
+    served.result
 }
 
 struct Sessions(HashMap<String, (Arc<ToolRuntime>, CallbackCatalog)>);
@@ -1528,12 +1585,14 @@ struct Running {
     resumable: bool,
     connection: u64,
     work: Arc<Pending>,
+    ended: Arc<AtomicBool>,
     cancel: Option<CancellationToken>,
 }
 
 struct Retained {
     text: String,
     work: Arc<Pending>,
+    ended: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -1605,15 +1664,32 @@ impl Pending {
     }
 }
 
+struct Listed {
+    work: Arc<Pending>,
+    ended: Arc<AtomicBool>,
+    next: Option<Arc<Self>>,
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(node) = next {
+            next = Arc::try_unwrap(node)
+                .ok()
+                .and_then(|mut node| node.next.take());
+        }
+    }
+}
+
 #[derive(Default)]
 struct Board {
-    sessions: Vec<(String, Arc<ToolRuntime>, CallbackCatalog)>,
-    pending: Vec<Arc<Pending>>,
+    sessions: Atom<Vec<(String, Arc<ToolRuntime>, CallbackCatalog)>>,
+    work: Atom<Option<Arc<Listed>>>,
 }
 
 impl Board {
     fn items(&self, items: &mut Vec<BusyItem>) {
-        for (session_id, runtime, catalog) in &self.sessions {
+        for (session_id, runtime, catalog) in self.sessions.get().iter() {
             catalog.state.read(|state| {
                 items.extend(state.origins.iter().map(|origin| BusyItem {
                     kind: BusyKind::Cell,
@@ -1630,7 +1706,13 @@ impl Board {
                     .map(|task| BusyItem::task(task, Some(session_id))),
             );
         }
-        for work in &self.pending {
+        let mut next = Option::clone(&self.work.get());
+        while let Some(node) = next {
+            next = node.next.clone();
+            if node.ended.load(Ordering::Acquire) {
+                continue;
+            }
+            let work = &node.work;
             let listed = work.kind == BusyKind::Cell
                 && items.iter().any(|item| {
                     item.kind == BusyKind::Cell
@@ -1663,7 +1745,9 @@ pub(super) struct Executor {
     connection: u64,
     resumable: bool,
     activity: HandActivity,
-    board: Arc<Atom<Board>>,
+    board: Arc<Board>,
+    listed: usize,
+    unlisted: usize,
     busy: bool,
     hold: Option<tokio::task::AbortHandle>,
 }
@@ -1679,6 +1763,8 @@ impl Executor {
             wire: Arc::default(),
             limit: Arc::new(AtomicUsize::new(usize::MAX)),
             backlog: Arc::default(),
+            flushing: Arc::default(),
+            resumed: Arc::default(),
         };
         let bus = Arc::new(CallbackBus {
             outgoing: outgoing.clone(),
@@ -1713,9 +1799,61 @@ impl Executor {
             resumable: false,
             activity,
             board,
+            listed: 0,
+            unlisted: 0,
             busy: false,
             hold: None,
         }
+    }
+
+    fn list(&mut self, work: &Arc<Pending>) -> Arc<AtomicBool> {
+        let ended = Arc::new(AtomicBool::new(false));
+        let next = Option::clone(&self.board.work.get());
+        self.board.work.set(Some(Arc::new(Listed {
+            work: Arc::clone(work),
+            ended: Arc::clone(&ended),
+            next,
+        })));
+        self.listed += 1;
+        ended
+    }
+
+    fn unlist(&mut self, ended: &AtomicBool) {
+        ended.store(true, Ordering::Release);
+        self.unlisted += 1;
+        if self.unlisted * 2 <= self.listed {
+            return;
+        }
+        let mut live = Vec::new();
+        let mut next = Option::clone(&self.board.work.get());
+        while let Some(node) = next {
+            if !node.ended.load(Ordering::Acquire) {
+                live.push((Arc::clone(&node.work), Arc::clone(&node.ended)));
+            }
+            next = node.next.clone();
+        }
+        self.listed = live.len();
+        self.unlisted = 0;
+        let mut head = None;
+        for (work, ended) in live.into_iter().rev() {
+            head = Some(Arc::new(Listed {
+                work,
+                ended,
+                next: head,
+            }));
+        }
+        self.board.work.set(head);
+    }
+
+    fn publish_sessions(&self) {
+        self.board.sessions.set(
+            self.runtimes
+                .iter()
+                .map(|(session_id, (runtime, catalog))| {
+                    (session_id.clone(), Arc::clone(runtime), catalog.clone())
+                })
+                .collect(),
+        );
     }
 
     fn publish(&mut self) {
@@ -1729,25 +1867,6 @@ impl Executor {
                 .any(|(_, catalog)| catalog.state.read(|state| !state.origins.is_empty()));
         self.activity.report(self.busy, busy);
         self.busy = busy;
-        self.board.set(Board {
-            sessions: self
-                .runtimes
-                .iter()
-                .map(|(session_id, (runtime, catalog))| {
-                    (session_id.clone(), Arc::clone(runtime), catalog.clone())
-                })
-                .collect(),
-            pending: self
-                .running
-                .values()
-                .map(|running| Arc::clone(&running.work))
-                .chain(
-                    self.retained
-                        .values()
-                        .map(|retained| Arc::clone(&retained.work)),
-                )
-                .collect(),
-        });
     }
 
     async fn definitions(&mut self) -> Vec<ToolDefinition> {
@@ -1781,7 +1900,7 @@ impl Executor {
             timer.abort();
         }
         self.bus.fail_pending();
-        self.outgoing.backlog().clear();
+        self.outgoing.clear_backlog();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         for (_, (runtime, _)) in self.runtimes.0.drain() {
@@ -1792,6 +1911,10 @@ impl Executor {
         self.calls.clear();
         self.turn_calls.clear();
         self.retained.clear();
+        self.board.work.set(None);
+        self.listed = 0;
+        self.unlisted = 0;
+        self.publish_sessions();
         self.resumable = false;
         self.publish();
     }
@@ -1832,8 +1955,9 @@ impl Executor {
             .as_ref()
             .is_some_and(|running| running.connection != self.connection);
         let status = status.as_deref();
-        let text = match running.filter(|running| running.resumable) {
-            Some(running) => {
+        let refused = matches!(&live, Err(message) if message == NOT_RECEIVED);
+        let text = match running {
+            Some(running) if running.resumable && !refused => {
                 let retained = match full {
                     Some(full) => reply_text(&self.outgoing, id, Ok(Some(full)), status)?,
                     None => reply_text(&self.outgoing, id, live.clone(), status)?,
@@ -1848,14 +1972,21 @@ impl Executor {
                     since: Instant::now(),
                     ..Pending::clone(&running.work)
                 });
+                self.unlist(&running.ended);
+                let ended = self.list(&work);
                 self.retained.insert(
                     id,
                     Retained {
                         text: retained,
                         work,
+                        ended,
                     },
                 );
                 text
+            }
+            Some(running) => {
+                self.unlist(&running.ended);
+                reply_text(&self.outgoing, id, live, status)?
             }
             None => reply_text(&self.outgoing, id, live, status)?,
         };
@@ -1872,7 +2003,17 @@ impl Executor {
         }
         self.outgoing.flush()?;
         let wanted = pending.iter().copied().collect::<HashSet<_>>();
-        self.retained.retain(|id, _| wanted.contains(id));
+        let forgotten = self
+            .retained
+            .keys()
+            .filter(|id| !wanted.contains(id))
+            .copied()
+            .collect::<Vec<_>>();
+        for id in forgotten {
+            if let Some(retained) = self.retained.remove(&id) {
+                self.unlist(&retained.ended);
+            }
+        }
         for id in pending {
             if let Some(retained) = self.retained.get(id) {
                 self.outgoing.push(retained.text.clone())?;
@@ -1894,11 +2035,37 @@ impl Drop for Executor {
     }
 }
 
+/// How a served connection ended: its result and the code of the peer's
+/// close frame, if one arrived.
+pub(super) struct Served {
+    pub(super) result: Result<(), CodeModeHostError>,
+    pub(super) close_code: Option<u16>,
+}
+
+/// Serves one connection. `heard` runs once the peer first sends a frame or
+/// a ping, which a brain does only after it took the connection.
 pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    socket: WebSocketStream<S>,
+    executor: &mut Executor,
+    policy: SocketPolicy,
+    heard: impl FnOnce() + Send,
+) -> Served {
+    let liveness = Liveness::new();
+    let result = serve_link(socket, executor, policy, &liveness, heard).await;
+    Served {
+        result,
+        close_code: liveness.close_code(),
+    }
+}
+
+async fn serve_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut socket: WebSocketStream<S>,
     executor: &mut Executor,
     policy: SocketPolicy,
+    liveness: &Arc<Liveness>,
+    heard: impl FnOnce() + Send,
 ) -> Result<(), CodeModeHostError> {
+    let mut heard = Some(heard);
     executor.connection += 1;
     let connection = executor.connection;
     let catalog = Frame::Catalog {
@@ -1913,15 +2080,14 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     };
     write(&mut socket, catalog.encode(policy.max_frame_bytes)?, policy).await?;
     let (sink, mut socket) = socket.split();
-    let liveness = Liveness::new();
     let watchdog = liveness.watch(policy.request_timeout / 2);
     tokio::pin!(watchdog);
-    let (wire, mut writer) = writer(sink, policy, Arc::clone(&liveness), Arc::default());
+    let (wire, mut writer) = writer(sink, policy, Arc::clone(liveness), Arc::default());
     executor
         .outgoing
         .limit
         .store(policy.max_frame_bytes, Ordering::Relaxed);
-    executor.outgoing.wire.set(Some(wire));
+    executor.outgoing.connect(wire);
     let outgoing = executor.outgoing.clone();
     let bus = Arc::clone(&executor.bus);
     let hands: Arc<dyn HandCalls> = executor.callbacks.clone();
@@ -1930,23 +2096,38 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             executor.publish();
             tokio::select! {
                 result = &mut writer.0 => return result.map_err(error)?,
+                () = liveness.heard.wait(), if heard.is_some() => {
+                    if let Some(heard) = heard.take() {
+                        heard();
+                    }
+                },
                 Some(done) = executor.results.recv() => {
                     if let Err(issue) = executor.deliver(done) {
                         tracing::error!(%issue, "remote reply could not be encoded");
                     }
                 },
-                frame = read_live(&mut socket, &liveness, watchdog.as_mut()) => {
+                frame = read_live(&mut socket, liveness, watchdog.as_mut()) => {
                     let Some(frame) = frame? else { return Ok(()); };
                     match frame {
                         Frame::CallbackResult { id, result } => { if let Some(tx) = bus.pending.update(|pending| pending.remove(&id)).and_then(|entry| entry.reply.take()) { let _ = tx.send(result); } },
-                        Frame::Ack { ids } => { for id in ids { executor.retained.remove(&id); } },
+                        Frame::Ack { ids } => { for id in ids { if let Some(retained) = executor.retained.remove(&id) { executor.unlist(&retained.ended); } } },
                         Frame::Resume { pending } => executor.resume(&pending)?,
-                        Frame::Request { id, operation, max_frame_bytes, compact, resumable } => {
+                        Frame::Request { id, operation, max_frame_bytes, compact, output_prefix, resumable } => {
                             if let Some(bytes) = max_frame_bytes { outgoing.limit.fetch_min(bytes, Ordering::Relaxed); }
                             executor.resumable |= resumable;
                             let work = Arc::new(Pending::new(id, &operation));
+                            let known = executor.running.get(&id).map(|running| Arc::clone(&running.work)).or_else(|| executor.retained.get(&id).map(|retained| Arc::clone(&retained.work)));
+                            if let Some(known) = known {
+                                if known.id != work.id {
+                                    outgoing.send(&Frame::Reply { id, result: Err(REQUEST_IN_USE.into()) })?;
+                                } else if let Some(retained) = executor.retained.get(&id) {
+                                    outgoing.push(retained.text.clone())?;
+                                }
+                                continue;
+                            }
                             let session_id = work.session_id.clone();
-                            executor.running.insert(id, Running { resumable, connection, work: Arc::clone(&work), cancel: None });
+                            let ended = executor.list(&work);
+                            executor.running.insert(id, Running { resumable, connection, work: Arc::clone(&work), ended, cancel: None });
                             executor.publish();
                             if executor.activity.draining() && matches!(&operation, RemoteOperation::Execute { .. } | RemoteOperation::Call { .. }) {
                                 executor.finish(id, Err(NOT_RECEIVED.into()));
@@ -1969,7 +2150,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 let selected = catalog.state.read(|state| state.selected_tools.clone());
                                 let excluded = executor.definitions().await.into_iter().filter(|definition| selected.as_ref().is_some_and(|names| !names.iter().any(|name| name == definition.name()))).map(|definition| definition.name().to_owned()).collect::<Vec<_>>();
                                 match executor.tools.clone().excluding_code_tools(excluded).into_builder().provider(catalog.clone()).hand_calls(Arc::clone(&hands)).build() {
-                                    Ok(selected) => { executor.runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(executor.workspace.clone(), Vec::new(), &selected)), catalog)); },
+                                    Ok(selected) => { executor.runtimes.insert(session_id.clone(), (Arc::new(ToolRuntime::new_with_tools(executor.workspace.clone(), Vec::new(), &selected)), catalog)); executor.publish_sessions(); },
                                     Err(issue) => {
                                         executor.finish(id, Err(issue.to_string()));
                                         continue;
@@ -2026,7 +2207,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 executor.finish(id, Err(issue.to_string()));
                                 continue;
                             }
-                            let runtime = if matches!(&operation, RemoteOperation::Cancel { .. }) { executor.runtimes.0.remove(&session_id) } else { executor.runtimes.get(&session_id).map(|(runtime, catalog)| (Arc::clone(runtime), catalog.clone())) };
+                            let runtime = if matches!(&operation, RemoteOperation::Cancel { .. }) { let removed = executor.runtimes.0.remove(&session_id); executor.publish_sessions(); removed } else { executor.runtimes.get(&session_id).map(|(runtime, catalog)| (Arc::clone(runtime), catalog.clone())) };
                             let runtime = runtime.map(|(runtime, catalog)| {
                                 let turn = catalog.turn();
                                 (runtime, catalog, turn)
@@ -2049,7 +2230,7 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     let Some((runtime, catalog, turn)) = runtime else {
                                         return match operation { RemoteOperation::Execute { .. } | RemoteOperation::Wait { .. } | RemoteOperation::Call { .. } => Err(error("this hand has no cells for the session: it restarted or reconnected since the cell started, so the cell's outcome is unknown")), _ => Ok(None) };
                                     };
-                                    let mut observer = Observer { id, outgoing:outgoing.clone(), catalog:catalog.clone(), calls:SentCalls::new(compact) };
+                                    let mut observer = Observer { id, outgoing:outgoing.clone(), catalog:catalog.clone(), calls:SentCalls::new(compact).output_prefix(output_prefix) };
                                     match operation {
                                         RemoteOperation::Execute { source, context, .. } => {
                                             let mut origin = CallbackOriginGuard { catalog:catalog.clone(), origin:context.call_id.clone(), retained:false };
@@ -2074,7 +2255,12 @@ pub(super) async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                         RemoteOperation::Call { name, input, context, .. } => {
                                             let owned = context.owned();
                                             tokio::select! {
-                                                output = runtime.execute_nested_tool(&name, input, owned.as_context()) => output_to_wire(output, compact).map(Some),
+                                                output = runtime.execute_nested_tool(&name, input, owned.as_context()) => encode_output(output, compact, output_prefix).and_then(|value| {
+                                                    if resumable && value.get("output_prefix").is_some() {
+                                                        full = Some(output_to_wire(output_from_wire(value.clone())?, compact)?);
+                                                    }
+                                                    Ok(Some(value))
+                                                }),
                                                 () = cancelled.cancelled() => Err(error(CALL_CANCELLED)),
                                             }
                                         },
