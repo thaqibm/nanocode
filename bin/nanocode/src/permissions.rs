@@ -92,6 +92,7 @@ impl Mode {
 }
 
 pub struct FilePair {
+    pub path: PathBuf,
     pub label: String,
     pub old: PathBuf,
     pub new: PathBuf,
@@ -129,9 +130,15 @@ impl Drop for Request {
     }
 }
 
+pub enum Message {
+    Approval(Request),
+    Original(crate::batch::Recorded),
+}
+
 pub struct Permissions {
     mode: AtomicU8,
-    requests: mpsc::UnboundedSender<Request>,
+    batch: bool,
+    requests: mpsc::UnboundedSender<Message>,
     workspace: PathBuf,
     sandbox: Option<Try>,
     scratch: PathBuf,
@@ -140,15 +147,18 @@ pub struct Permissions {
 impl Permissions {
     pub fn new(
         mode: Mode,
+        batch: bool,
         workspace: PathBuf,
         home: &Path,
-    ) -> crate::host::Result<(Arc<Self>, mpsc::UnboundedReceiver<Request>)> {
+        base: &Path,
+    ) -> crate::host::Result<(Arc<Self>, mpsc::UnboundedReceiver<Message>)> {
         let (requests, receiver) = mpsc::unbounded_channel();
-        let sandbox = Try::install(home)?;
-        let scratch = std::env::temp_dir().join(format!("nanocode-review-{}", std::process::id()));
+        let sandbox = Try::install(home, base)?;
+        let scratch = base.join(format!("nanocode-review-{}", std::process::id()));
         Ok((
             Arc::new(Self {
                 mode: AtomicU8::new(mode.index()),
+                batch,
                 requests,
                 workspace,
                 sandbox,
@@ -180,7 +190,7 @@ impl Permissions {
     async fn ask(&self, mut request: Request) -> bool {
         let (reply, answer) = oneshot::channel();
         request.reply = Some(reply);
-        if self.requests.send(request).is_err() {
+        if self.requests.send(Message::Approval(request)).is_err() {
             return false;
         }
         answer.await.unwrap_or(false)
@@ -203,6 +213,17 @@ impl Permissions {
             reply: None,
             scratch: None,
         }
+    }
+
+    fn record(&self, path: &Path) -> Result<(), String> {
+        let original = crate::batch::snapshot(path, &self.scratch.join("originals"))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        self.requests
+            .send(Message::Original(crate::batch::Recorded {
+                path: path.to_owned(),
+                original,
+            }))
+            .map_err(|_| "the review queue is closed".to_owned())
     }
 
     fn label(&self, path: &Path) -> String {
@@ -235,6 +256,32 @@ impl Permissions {
             sandbox.discard();
             return Ok((!failures.is_empty()).then(|| commit_failures(&failures)));
         }
+        if self.batch {
+            let mut covered: Vec<&Path> = Vec::new();
+            for change in &inside {
+                if covered
+                    .iter()
+                    .any(|ancestor| change.path.starts_with(ancestor))
+                {
+                    continue;
+                }
+                if let Err(error) = self.record(&change.path) {
+                    sandbox.discard();
+                    return Err(format!(
+                        "nanocode could not save the originals of this command's changes for review, so none were applied: {error}"
+                    ));
+                }
+                if matches!(
+                    change.kind,
+                    Kind::CreatedDir | Kind::ReplacedDir | Kind::Deleted
+                ) {
+                    covered.push(&change.path);
+                }
+            }
+            let failures = sandbox.commit(&changes);
+            sandbox.discard();
+            return Ok((!failures.is_empty()).then(|| commit_failures(&failures)));
+        }
         let mut request = self.request(session_id, "Command changes files", command);
         request.command = true;
         let mut diffs = Vec::new();
@@ -252,7 +299,12 @@ impl Permissions {
                 }
             };
             diffs.push(sandbox::unified_diff(&old, &new, &label));
-            request.files.push(FilePair { label, old, new });
+            request.files.push(FilePair {
+                path: change.path.clone(),
+                label,
+                old,
+                new,
+            });
         }
         request.diff = diffs.join("\n");
         request.elsewhere = outside
@@ -406,7 +458,22 @@ impl GatedTool {
         let mut request =
             self.permissions
                 .request(session_id, format!("{name} files"), String::new());
-        match self.preview(&input, context).await {
+        let preview = self.preview(&input, context).await;
+        if self.permissions.batch
+            && let Ok((_, files, scratch)) = &preview
+        {
+            let recorded = files
+                .iter()
+                .try_for_each(|file| self.permissions.record(&file.path));
+            drop(std::fs::remove_dir_all(scratch));
+            return match recorded {
+                Ok(()) => self.inner.execute(input, context).await,
+                Err(error) => Ok(ToolOutput::error(format!(
+                    "nanocode could not save the original files for review, so nothing was changed: {error}"
+                ))),
+            };
+        }
+        match preview {
             Ok((diff, files, scratch)) => {
                 request.detail = files
                     .iter()
@@ -490,7 +557,12 @@ impl GatedTool {
                 PathBuf::from("/dev/null")
             };
             diffs.push(sandbox::unified_diff(&old, &new, &label));
-            pairs.push(FilePair { label, old, new });
+            pairs.push(FilePair {
+                path,
+                label,
+                old,
+                new,
+            });
         }
         Ok((diffs.join("\n"), pairs, scratch))
     }

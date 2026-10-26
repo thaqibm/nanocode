@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod approval;
+mod batch;
 mod cli;
 mod commands;
 mod config;
@@ -41,6 +42,7 @@ use crate::{
 
 pub use host::{ModelClients, Panel};
 
+const DIFF_PREVIEW_LINES: usize = 10;
 const TELEMETRY_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 
 fn cli_home(cli: &Cli) -> Result<PathBuf> {
@@ -182,7 +184,7 @@ struct Prepared {
     thinking: Thinking,
     tier: ServiceTier,
     home: PathBuf,
-    approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Request>,
+    approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Message>,
 }
 
 async fn prepare(
@@ -268,7 +270,13 @@ async fn prepare(
     };
     let (runners, runner_servers) = host::runner_configs(&args.remote)?;
     let mode = config.permissions.unwrap_or_default();
-    let (permissions, approvals) = permissions::Permissions::new(mode, workspace.clone(), &home)?;
+    let (permissions, approvals) = permissions::Permissions::new(
+        mode,
+        config.batch && !headless,
+        workspace.clone(),
+        &home,
+        &sandbox::base(config.sandbox_dir.as_deref()),
+    )?;
     let host_config = HostConfig {
         workspace,
         store,
@@ -282,6 +290,8 @@ async fn prepare(
         diff_tool: config.diff_tool,
         diff_viewer: config.diff_viewer,
         computer_use: args.computer_use || config.computer_use,
+        diff_preview_lines: config.diff_preview_lines.unwrap_or(DIFF_PREVIEW_LINES),
+        auto_diff_tool: config.auto_diff_tool,
     };
     let config = host_config;
     let host = tracing::Instrument::instrument(
@@ -618,9 +628,16 @@ async fn hand(args: HandArgs) -> Result<()> {
 }
 
 async fn answer_in_terminal(
-    mut approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Request>,
+    mut approvals: tokio::sync::mpsc::UnboundedReceiver<permissions::Message>,
 ) {
-    while let Some(mut request) = approvals.recv().await {
+    while let Some(message) = approvals.recv().await {
+        let mut request = match message {
+            permissions::Message::Approval(request) => request,
+            permissions::Message::Original(recorded) => {
+                recorded.discard();
+                continue;
+            }
+        };
         let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
         let mut stderr = std::io::stderr();
         drop(writeln!(stderr, "\n{}: {}", request.title, request.detail));

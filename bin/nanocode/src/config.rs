@@ -18,6 +18,12 @@ pub struct Config {
     #[serde(default)]
     pub computer_use: bool,
     #[serde(default)]
+    pub batch: bool,
+    #[serde(default)]
+    pub auto_diff_tool: bool,
+    pub diff_preview_lines: Option<usize>,
+    pub sandbox_dir: Option<PathBuf>,
+    #[serde(default)]
     pub providers: BTreeMap<String, Provider>,
 }
 

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{io::Write, path::PathBuf};
 
 use nanocode_tui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
@@ -14,11 +14,20 @@ use nanocode_tui::{
 };
 
 use crate::{
-    app::{App, shlex_words},
+    app::{App, TurnState, shlex_words},
+    batch::Recorded,
     permissions::{Mode, Request},
 };
 
-const FOOTER: &str = "y approve · n deny · v view diff · d diff tool · ↑↓ scroll · shift+tab mode";
+const APPROVAL_FOOTER: &str =
+    "y approve · A approve all waiting · n deny · v view diff · d diff tool · shift+tab mode";
+const REVIEW_FOOTER: &str =
+    "y keep all · r revert all · x revert file · ↑↓ file · v view diff · d diff tool · esc later";
+
+pub struct Review {
+    selected: usize,
+    diffs: Vec<String>,
+}
 
 impl App {
     pub(crate) fn permission_mode(&self) -> Option<Mode> {
@@ -44,6 +53,54 @@ impl App {
         self.flash(format!("{} · {}{sandbox}", mode.label(), mode.describe()));
     }
 
+    pub(crate) fn record_original(&mut self, recorded: Recorded) {
+        if self
+            .ledger
+            .iter()
+            .any(|existing| recorded.path.starts_with(&existing.path))
+        {
+            recorded.discard();
+            return;
+        }
+        self.ledger.push(recorded);
+        self.review_dismissed = false;
+        if let Some(review) = &mut self.review {
+            review.diffs = diffs(&self.ledger, &self.host.config.workspace);
+        }
+    }
+
+    pub(crate) fn after_events(&mut self, terminal: &mut TerminalSession) -> bool {
+        let mut changed = false;
+        if self.review.is_none()
+            && !self.review_dismissed
+            && !self.ledger.is_empty()
+            && matches!(self.turn, TurnState::Idle)
+        {
+            self.open_review(false);
+            changed = true;
+        }
+        if std::mem::take(&mut self.pending_diff_tool) {
+            self.open_diff_tool(terminal, true);
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) fn open_review(&mut self, requested: bool) {
+        if self.ledger.is_empty() {
+            if requested {
+                self.flash("no changes to review");
+            }
+            return;
+        }
+        self.review = Some(Review {
+            selected: 0,
+            diffs: diffs(&self.ledger, &self.host.config.workspace),
+        });
+        self.review_dismissed = false;
+        self.pending_diff_tool = self.host.config.auto_diff_tool;
+    }
+
     pub(crate) fn approval_key(&mut self, key: KeyEvent, terminal: &mut TerminalSession) -> bool {
         self.approvals.retain(|request| !request.is_stale());
         if self.approvals.is_empty() {
@@ -52,19 +109,97 @@ impl App {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('y' | 'a') | KeyCode::Enter => self.decide(true),
+            KeyCode::Char('A') => {
+                let count = self.approvals.len();
+                for mut request in self.approvals.drain(..) {
+                    request.answer(true);
+                }
+                self.flash(format!("approved {count}"));
+            }
             KeyCode::Char('n') | KeyCode::Esc => self.decide(false),
             KeyCode::Char('c') if control => self.decide(false),
-            KeyCode::Char('v') => self.view_diff(terminal),
-            KeyCode::Char('d') => self.open_diff_tool(terminal),
+            KeyCode::Char('v') => {
+                let diff = self
+                    .approvals
+                    .front()
+                    .map(|request| request.diff.clone())
+                    .unwrap_or_default();
+                self.view_diff(terminal, diff);
+            }
+            KeyCode::Char('d') => self.open_diff_tool(terminal, false),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.approval_scroll = self.approval_scroll.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => self.approval_scroll += 1,
-            KeyCode::PageUp => self.approval_scroll = self.approval_scroll.saturating_sub(10),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.approval_scroll += 10,
             _ => {}
         }
         true
+    }
+
+    pub(crate) fn review_key(&mut self, key: KeyEvent, terminal: &mut TerminalSession) -> bool {
+        let Some(review) = &mut self.review else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let count = self.ledger.len();
+                for recorded in self.ledger.drain(..) {
+                    recorded.discard();
+                }
+                self.review = None;
+                self.flash(format!("kept {count} changed paths"));
+            }
+            KeyCode::Char('r') => self.revert(None),
+            KeyCode::Char('x') => {
+                let selected = review.selected;
+                self.revert(Some(selected));
+            }
+            KeyCode::Up | KeyCode::Char('k') => review.selected = review.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                review.selected = (review.selected + 1).min(self.ledger.len().saturating_sub(1));
+            }
+            KeyCode::Char('v') => {
+                let diff = review.diffs.join("\n");
+                self.view_diff(terminal, diff);
+            }
+            KeyCode::Char('d') => self.open_diff_tool(terminal, false),
+            KeyCode::Esc => {
+                self.review = None;
+                self.review_dismissed = true;
+                self.flash("review later with /review");
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn revert(&mut self, index: Option<usize>) {
+        let mut targets = match index {
+            Some(index) if index < self.ledger.len() => vec![self.ledger.remove(index)],
+            Some(_) => return,
+            None => std::mem::take(&mut self.ledger),
+        };
+        targets.sort_by_key(|recorded| recorded.path.components().count());
+        let mut failures = Vec::new();
+        for recorded in &targets {
+            if let Err(error) = recorded.restore() {
+                failures.push(format!("{}: {error}", recorded.path.display()));
+            }
+            recorded.discard();
+        }
+        let count = targets.len();
+        if failures.is_empty() {
+            self.flash(format!("reverted {count} changed paths"));
+        } else {
+            self.notice(
+                nanocode_tui::transcript::NoticeLevel::Error,
+                format!("could not revert: {}", failures.join("; ")),
+            );
+        }
+        self.review = (!self.ledger.is_empty()).then(|| Review {
+            selected: index.unwrap_or(0).min(self.ledger.len().saturating_sub(1)),
+            diffs: diffs(&self.ledger, &self.host.config.workspace),
+        });
     }
 
     fn decide(&mut self, approved: bool) {
@@ -73,14 +208,14 @@ impl App {
             self.flash(if approved { "approved" } else { "denied" });
         }
         self.approval_scroll = 0;
+        if !self.approvals.is_empty() {
+            self.pending_diff_tool = self.host.config.auto_diff_tool;
+        }
     }
 
-    fn view_diff(&mut self, terminal: &mut TerminalSession) {
-        let Some(request) = self.approvals.front() else {
-            return;
-        };
-        if request.diff.is_empty() {
-            self.flash("this request has no diff");
+    fn view_diff(&mut self, terminal: &mut TerminalSession, diff: String) {
+        if diff.is_empty() {
+            self.flash("there is no diff to show");
             return;
         }
         let viewer = self
@@ -97,7 +232,6 @@ impl App {
         if words[0] == "delta" && !words.iter().any(|word| word.starts_with("--paging")) {
             words.push("--paging=always".to_owned());
         }
-        let diff = request.diff.clone();
         drop(terminal.suspend());
         let result = std::process::Command::new(&words[0])
             .args(&words[1..])
@@ -115,12 +249,28 @@ impl App {
         }
     }
 
-    fn open_diff_tool(&mut self, terminal: &mut TerminalSession) {
-        let Some(request) = self.approvals.front() else {
-            return;
+    fn diff_pairs(&self, every: bool) -> Vec<(PathBuf, PathBuf)> {
+        if let Some(request) = self.approvals.front() {
+            return request
+                .files
+                .iter()
+                .map(|file| (file.old.clone(), file.new.clone()))
+                .collect();
+        }
+        let Some(review) = &self.review else {
+            return Vec::new();
         };
-        if request.files.is_empty() {
-            self.flash("this request has no files to compare");
+        self.ledger
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| every || *index == review.selected)
+            .map(|(_, recorded)| (recorded.before(), recorded.after()))
+            .collect()
+    }
+
+    fn open_diff_tool(&mut self, terminal: &mut TerminalSession, every: bool) {
+        let pairs = self.diff_pairs(every);
+        if pairs.is_empty() {
             return;
         }
         let tool = self
@@ -133,11 +283,6 @@ impl App {
             self.flash(format!("could not parse diff_tool {tool:?}"));
             return;
         };
-        let pairs = request
-            .files
-            .iter()
-            .map(|file| (file.old.clone(), file.new.clone()))
-            .collect::<Vec<_>>();
         drop(terminal.suspend());
         let mut failure = None;
         for (old, new) in pairs {
@@ -170,19 +315,52 @@ impl App {
     }
 }
 
-pub(crate) fn render(app: &mut App, area: Rect, frame: &mut Canvas<'_>) {
-    app.approvals.retain(|request| !request.is_stale());
-    let Some(request) = app.approvals.front() else {
-        return;
-    };
-    let theme = &app.theme;
-    let width = area.width.saturating_sub(2);
-    let root = app.session_id();
-    let mut lines = header(request, root.as_deref(), app.permission_mode(), theme);
-    if !request.diff.is_empty() {
-        lines.push(Line::default());
-        lines.extend(nanocode_tui::diff::render(&request.diff, width, theme));
+fn label(recorded: &Recorded, workspace: &std::path::Path) -> String {
+    recorded
+        .path
+        .strip_prefix(workspace)
+        .unwrap_or(&recorded.path)
+        .display()
+        .to_string()
+}
+
+fn diffs(ledger: &[Recorded], workspace: &std::path::Path) -> Vec<String> {
+    ledger
+        .iter()
+        .map(|recorded| {
+            crate::sandbox::unified_diff(
+                &recorded.before(),
+                &recorded.after(),
+                &label(recorded, workspace),
+            )
+        })
+        .collect()
+}
+
+fn preview(diff: &str, width: u16, limit: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let (mut lines, total) = nanocode_tui::diff::render_rows(diff, width, theme, limit);
+    if total > limit {
+        lines.push(Line::styled(
+            format!(
+                "… {} more lines · v to view all · d for the diff tool",
+                total - limit
+            ),
+            Style::default().fg(theme.muted()),
+        ));
     }
+    lines
+}
+
+fn panel(
+    area: Rect,
+    frame: &mut Canvas<'_>,
+    theme: &Theme,
+    title: &str,
+    footer: &str,
+    lines: Vec<Line<'static>>,
+    scroll: usize,
+) -> usize {
+    let width = area.width.saturating_sub(2);
     let rows = lines
         .iter()
         .map(|line| line.width().div_ceil(usize::from(width.max(1))).max(1))
@@ -191,21 +369,81 @@ pub(crate) fn render(app: &mut App, area: Rect, frame: &mut Canvas<'_>) {
         .unwrap_or(u16::MAX)
         .min(area.height.saturating_mul(3) / 4);
     let panel = overlay::bottom(area, area.width, height);
-    let pending = app.approvals.len();
-    let title = if pending > 1 {
-        format!("Permission · {} · 1 of {pending}", request.title)
-    } else {
-        format!("Permission · {}", request.title)
-    };
-    let inner = overlay::frame(panel, frame.buffer_mut(), theme, &title, Some(FOOTER));
-    let scroll = app
-        .approval_scroll
-        .min(lines.len().saturating_sub(usize::from(inner.height)));
-    app.approval_scroll = scroll;
+    let inner = overlay::frame(panel, frame.buffer_mut(), theme, title, Some(footer));
+    let scroll = scroll.min(rows.saturating_sub(usize::from(inner.height)));
     Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
         .render(inner, frame.buffer_mut());
+    scroll
+}
+
+pub(crate) fn render(app: &mut App, area: Rect, frame: &mut Canvas<'_>) {
+    app.approvals.retain(|request| !request.is_stale());
+    let width = area.width.saturating_sub(2);
+    let limit = app.host.config.diff_preview_lines;
+    if let Some(request) = app.approvals.front() {
+        let theme = &app.theme;
+        let root = app.session_id();
+        let mut lines = header(request, root.as_deref(), app.permission_mode(), theme);
+        if !request.diff.is_empty() {
+            lines.push(Line::default());
+            lines.extend(preview(&request.diff, width, limit, theme));
+        }
+        let pending = app.approvals.len();
+        let title = if pending > 1 {
+            format!("Permission · {} · 1 of {pending}", request.title)
+        } else {
+            format!("Permission · {}", request.title)
+        };
+        app.approval_scroll = panel(
+            area,
+            frame,
+            theme,
+            &title,
+            APPROVAL_FOOTER,
+            lines,
+            app.approval_scroll,
+        );
+        return;
+    }
+    let Some(review) = &app.review else {
+        return;
+    };
+    let theme = &app.theme;
+    let workspace = &app.host.config.workspace;
+    let mut lines = Vec::new();
+    for (index, recorded) in app.ledger.iter().enumerate() {
+        let selected = index == review.selected;
+        let style = if selected {
+            Style::default()
+                .fg(theme.text())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted())
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                Style::default().fg(theme.accent()),
+            ),
+            Span::styled(
+                format!("{} ", recorded.status()),
+                Style::default().fg(theme.thinking_high()),
+            ),
+            Span::styled(label(recorded, workspace), style),
+        ]));
+    }
+    if let Some(diff) = review
+        .diffs
+        .get(review.selected)
+        .filter(|diff| !diff.is_empty())
+    {
+        lines.push(Line::default());
+        lines.extend(preview(diff, width, limit, theme));
+    }
+    let title = format!("Review · {} changed paths", app.ledger.len());
+    panel(area, frame, theme, &title, REVIEW_FOOTER, lines, 0);
 }
 
 fn header(

@@ -237,6 +237,8 @@ pub struct HostConfig {
     pub diff_tool: Option<String>,
     pub diff_viewer: Option<String>,
     pub computer_use: bool,
+    pub diff_preview_lines: usize,
+    pub auto_diff_tool: bool,
 }
 
 #[derive(Clone)]

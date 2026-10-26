@@ -140,6 +140,7 @@ pub enum AppEvent {
         result: std::result::Result<String, String>,
     },
     Approval(Box<crate::permissions::Request>),
+    Original(Box<crate::batch::Recorded>),
     Notice(NoticeLevel, String),
     Applied(std::result::Result<(ModelSelection, Thinking, ServiceTier, String), String>),
 }
@@ -149,6 +150,7 @@ impl AppEvent {
         match self {
             Self::Reload => "reload",
             Self::Approval(_) => "approval",
+            Self::Original(_) => "original",
             Self::Agent { .. } => "agent",
             Self::TurnStarted { .. } => "turn_started",
             Self::RoutedTurn { .. } => "routed_turn",
@@ -251,7 +253,7 @@ pub struct Launch {
     pub tier_override: Option<ServiceTier>,
     pub reload: Option<reload::State>,
     pub reload_path: Option<PathBuf>,
-    pub approvals: Option<UnboundedReceiver<crate::permissions::Request>>,
+    pub approvals: Option<UnboundedReceiver<crate::permissions::Message>>,
 }
 
 pub struct App {
@@ -319,6 +321,10 @@ pub struct App {
     pub(crate) panes: crate::side::Panes,
     pub(crate) approvals: std::collections::VecDeque<crate::permissions::Request>,
     pub(crate) approval_scroll: usize,
+    pub(crate) ledger: Vec<crate::batch::Recorded>,
+    pub(crate) review: Option<crate::approval::Review>,
+    pub(crate) review_dismissed: bool,
+    pub(crate) pending_diff_tool: bool,
 }
 
 pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
@@ -396,6 +402,10 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         panes: crate::side::Panes::default(),
         approvals: std::collections::VecDeque::new(),
         approval_scroll: 0,
+        ledger: Vec::new(),
+        review: None,
+        review_dismissed: false,
+        pending_diff_tool: false,
     };
     let instance = reload::Instance::start(app.tx.clone()).await?;
     if let Some(state) = launch.reload {
@@ -693,12 +703,20 @@ fn forward_notices(mut notices: crate::host::Notices, tx: UnboundedSender<AppEve
 }
 
 fn forward_approvals(
-    mut approvals: UnboundedReceiver<crate::permissions::Request>,
+    mut approvals: UnboundedReceiver<crate::permissions::Message>,
     tx: UnboundedSender<AppEvent>,
 ) {
     tokio::spawn(async move {
-        while let Some(request) = approvals.recv().await {
-            if tx.send(AppEvent::Approval(Box::new(request))).is_err() {
+        while let Some(message) = approvals.recv().await {
+            let event = match message {
+                crate::permissions::Message::Approval(request) => {
+                    AppEvent::Approval(Box::new(request))
+                }
+                crate::permissions::Message::Original(recorded) => {
+                    AppEvent::Original(Box::new(recorded))
+                }
+            };
+            if tx.send(event).is_err() {
                 break;
             }
         }
@@ -843,6 +861,9 @@ impl App {
                     {
                         redraw = redraw.max(self.handle_app(event));
                     }
+                    if self.after_events(terminal) {
+                        redraw = Redraw::Immediate;
+                    }
                     match redraw {
                         Redraw::Immediate => {
                             metrics.stream();
@@ -957,9 +978,14 @@ impl App {
                 self.request_reload(false);
                 Redraw::Immediate
             }
+            AppEvent::Original(recorded) => {
+                self.record_original(*recorded);
+                Redraw::None
+            }
             AppEvent::Approval(request) => {
                 if self.approvals.is_empty() {
                     self.approval_scroll = 0;
+                    self.pending_diff_tool = self.host.config.auto_diff_tool;
                 }
                 self.approvals.push_back(*request);
                 Redraw::Immediate
@@ -2023,6 +2049,9 @@ impl App {
         if self.approval_key(key, terminal) {
             return;
         }
+        if self.review_key(key, terminal) {
+            return;
+        }
         if self.overlay.is_some() {
             self.overlay_key(key);
             return;
@@ -2545,6 +2574,7 @@ impl App {
                 self.flash(format!("removed {count} attachment(s)"));
             }
             "mouse" => self.toggle_mouse = true,
+            "review" => self.open_review(true),
             "help" | "keys" | "?" => self.overlay = Some(Overlay::Help),
             "quit" | "exit" | "q" => self.quit = true,
             "reload" | "restart" => self.request_reload(true),

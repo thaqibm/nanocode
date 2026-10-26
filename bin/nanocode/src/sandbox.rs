@@ -44,8 +44,8 @@ pub struct Try {
 }
 
 impl Try {
-    pub fn install(home: &Path) -> io::Result<Option<Self>> {
-        remove_stale();
+    pub fn install(home: &Path, base: &Path) -> io::Result<Option<Self>> {
+        drop(remove_stale(&[base.to_owned(), std::env::temp_dir()]));
         if !cfg!(target_os = "linux") || !probe() {
             return Ok(None);
         }
@@ -58,7 +58,7 @@ impl Try {
             std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))?;
             std::fs::rename(&partial, &script)?;
         }
-        let root = std::env::temp_dir().join(format!("nanocode-try-{}", std::process::id()));
+        let root = base.join(format!("nanocode-try-{}", std::process::id()));
         std::fs::create_dir_all(&root)?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         Ok(Some(Self { script, root }))
@@ -91,14 +91,32 @@ impl Try {
     }
 }
 
-pub fn remove_stale() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
-    };
-    for entry in entries.filter_map(std::result::Result::ok) {
-        let name = entry.file_name();
-        let Some(pid) = name
-            .to_str()
+pub fn base(configured: Option<&Path>) -> PathBuf {
+    configured.map_or_else(
+        || {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|directory| directory.is_dir())
+                .unwrap_or_else(std::env::temp_dir)
+        },
+        Path::to_path_buf,
+    )
+}
+
+pub fn remove_stale(bases: &[PathBuf]) -> (Vec<(PathBuf, io::Result<()>)>, usize) {
+    let mut removed = Vec::new();
+    let mut live = 0;
+    let entries = bases
+        .iter()
+        .filter_map(|base| std::fs::read_dir(base).ok())
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .collect::<std::collections::BTreeSet<_>>();
+    for path in entries {
+        let Some(pid) = path
+            .file_name()
+            .and_then(|name| name.to_str())
             .and_then(|name| {
                 name.strip_prefix("nanocode-try-")
                     .or_else(|| name.strip_prefix("nanocode-review-"))
@@ -107,10 +125,14 @@ pub fn remove_stale() {
         else {
             continue;
         };
-        if pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists() {
-            drop(remove_tree(&entry.path()));
+        if pid == std::process::id() || Path::new(&format!("/proc/{pid}")).exists() {
+            live += 1;
+        } else {
+            let result = remove_tree(&path);
+            removed.push((path, result));
         }
     }
+    (removed, live)
 }
 
 fn probe() -> bool {
@@ -263,7 +285,7 @@ fn apply(change: &Change) -> io::Result<()> {
     }
 }
 
-fn remove_any(path: &Path) -> io::Result<()> {
+pub fn remove_any(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
@@ -282,7 +304,7 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-fn remove_tree(path: &Path) -> io::Result<()> {
+pub fn remove_tree(path: &Path) -> io::Result<()> {
     fn writable(path: &Path) {
         if let Ok(metadata) = std::fs::symlink_metadata(path)
             && metadata.is_dir()
@@ -317,17 +339,16 @@ pub fn unified_diff(old: &Path, new: &Path, label: &str) -> String {
     let new_name = new.to_string_lossy();
     text.lines()
         .map(|line| {
-            if line.starts_with("diff --git ") {
-                format!("diff --git a/{label} b/{label}")
-            } else if line.starts_with("--- ") && !line.ends_with("/dev/null") {
-                format!("--- a/{label}")
-            } else if line.starts_with("+++ ") && !line.ends_with("/dev/null") {
-                format!("+++ b/{label}")
-            } else if line.contains(old_name.trim_start_matches('/'))
-                || line.contains(new_name.trim_start_matches('/'))
-            {
-                line.replace(old_name.trim_start_matches('/'), label)
-                    .replace(new_name.trim_start_matches('/'), label)
+            let header = ["diff --git ", "--- ", "+++ ", "Binary files ", "rename "]
+                .iter()
+                .any(|prefix| line.starts_with(prefix));
+            if header {
+                [old_name.as_ref(), new_name.as_ref()]
+                    .into_iter()
+                    .filter(|name| *name != "/dev/null")
+                    .fold(line.to_owned(), |line, name| {
+                        line.replace(name.trim_start_matches('/'), label)
+                    })
             } else {
                 line.to_owned()
             }

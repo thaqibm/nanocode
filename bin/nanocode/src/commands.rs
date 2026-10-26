@@ -1,4 +1,8 @@
-pub const COMMANDS: [(&str, &str); 31] = [
+pub const COMMANDS: [(&str, &str); 32] = [
+    (
+        "/review",
+        "review, keep or revert the file changes made since the last review (batch = true)",
+    ),
     (
         "/model",
         "choose harness, model, thinking and speed for a new thread",
