@@ -13,6 +13,7 @@
 }:
 let
   manifest = lib.importTOML ../Cargo.toml;
+  cuaHash = "sha256-iKqkvdyAV8Mh3a1yK2wOjSIECi/t3VvQ5PJD3fyVUyw=";
 in
 rustPlatform.buildRustPackage {
   pname = "nanocode";
@@ -34,7 +35,17 @@ rustPlatform.buildRustPackage {
 
   cargoLock = {
     lockFile = ../Cargo.lock;
-    allowBuiltinFetchGit = true;
+    outputHashes = lib.genAttrs [
+      "cua-cursor-motion-0.38.0"
+      "cua-driver-contract-0.38.0"
+      "cua-driver-core-0.38.0"
+      "cua-driver-sdk-0.38.0"
+      "cursor-overlay-0.38.0"
+      "pip-preview-0.38.0"
+      "platform-linux-0.38.0"
+      "platform-macos-0.38.0"
+      "platform-windows-0.38.0"
+    ] (_: cuaHash);
   };
 
   postPatch = ''

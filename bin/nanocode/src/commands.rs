@@ -20,7 +20,7 @@ pub const COMMANDS: [(&str, &str); 32] = [
     ("/resume", "resume a saved session"),
     (
         "/login",
-        "sign in with ChatGPT or Claude: /login codex|claude",
+        "sign in with ChatGPT or Claude, or save a provider API key: /login codex|claude|<provider>",
     ),
     ("/new", "start a new session"),
     (

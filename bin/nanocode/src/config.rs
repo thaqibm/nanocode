@@ -78,16 +78,7 @@ impl Provider {
         }
     }
 
-    pub fn key(&self, name: &str) -> Result<(String, String)> {
-        if let Some(path) = &self.api_key_file {
-            let key = std::fs::read_to_string(path)
-                .map_err(|error| format!("provider {name}: {}: {error}", path.display()))?;
-            let key = key.trim();
-            if key.is_empty() {
-                return Err(format!("provider {name}: {} is empty", path.display()).into());
-            }
-            return Ok((key.to_owned(), path.display().to_string()));
-        }
+    pub fn key(&self, name: &str, home: &Path) -> Result<(String, String)> {
         if let Some(variable) = &self.api_key_env {
             return std::env::var(variable)
                 .ok()
@@ -95,14 +86,74 @@ impl Provider {
                 .map(|key| (key, variable.clone()))
                 .ok_or_else(|| format!("provider {name}: {variable} is not set").into());
         }
-        self.api_key
-            .clone()
-            .filter(|key| !key.trim().is_empty())
-            .map(|key| (key, "config api_key".to_owned()))
-            .ok_or_else(|| {
-                format!("provider {name} needs api_key, api_key_env or api_key_file").into()
-            })
+        if let Some(key) = self.api_key.clone().filter(|key| !key.trim().is_empty()) {
+            return Ok((key, "config api_key".to_owned()));
+        }
+        let path = self.key_path(name, home);
+        match std::fs::read_to_string(&path) {
+            Ok(key) if !key.trim().is_empty() => {
+                Ok((key.trim().to_owned(), path.display().to_string()))
+            }
+            Ok(_) => Err(missing_key(name)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(missing_key(name)),
+            Err(error) => Err(format!("provider {name}: {}: {error}", path.display()).into()),
+        }
     }
+
+    pub fn key_path(&self, name: &str, home: &Path) -> PathBuf {
+        self.api_key_file
+            .clone()
+            .unwrap_or_else(|| home.join("credentials").join(format!("{name}.key")))
+    }
+
+    pub fn save_key(&self, name: &str, home: &Path, key: &str) -> Result<PathBuf> {
+        if let Some(variable) = &self.api_key_env {
+            return Err(format!(
+                "provider {name} reads its key from ${variable}; set that variable instead"
+            )
+            .into());
+        }
+        if self
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+        {
+            return Err(format!(
+                "provider {name} has api_key set in the config, which would win over a saved key; remove it first"
+            )
+            .into());
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("no key entered".into());
+        }
+        let path = self.key_path(name, home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        let partial = path.with_extension(format!("partial-{}", std::process::id()));
+        let write = || -> std::io::Result<()> {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&partial)?;
+            file.write_all(key.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&partial, &path)
+        };
+        write().map_err(|error| {
+            drop(std::fs::remove_file(&partial));
+            format!("{}: {error}", path.display())
+        })?;
+        Ok(path)
+    }
+}
+
+fn missing_key(name: &str) -> crate::host::Error {
+    format!("provider {name} has no API key: run `nanocode login {name}` or /login {name}").into()
 }
 
 impl Config {

@@ -18,7 +18,58 @@ impl App {
             "claude" | "anthropic" => {
                 tokio::spawn(claude(tx));
             }
-            _ => self.notice(NoticeLevel::Info, "usage: /login codex|claude"),
+            name if self.host.config.providers.contains_key(name) => {
+                self.pending_login = Some(name.to_owned());
+            }
+            _ => {
+                let providers = self
+                    .host
+                    .config
+                    .providers
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "usage: /login {}",
+                        ["codex", "claude"]
+                            .into_iter()
+                            .chain(providers)
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    ),
+                );
+            }
+        }
+    }
+}
+
+impl App {
+    pub(crate) fn provider_login(
+        &mut self,
+        name: &str,
+        terminal: &mut nanocode_tui::terminal::TerminalSession,
+    ) {
+        let config = crate::config::Config {
+            providers: self.host.config.providers.clone(),
+            ..crate::config::Config::default()
+        };
+        drop(terminal.suspend());
+        let result = crate::credentials::login(&config, &self.home, name);
+        drop(terminal.resume());
+        match result {
+            Ok(path) => {
+                self.notice(
+                    NoticeLevel::Info,
+                    format!(
+                        "saved the {name} key to {}; reloading to use it",
+                        path.display()
+                    ),
+                );
+                self.request_reload(false);
+            }
+            Err(error) => self.notice(NoticeLevel::Error, format!("login {name}: {error}")),
         }
     }
 }

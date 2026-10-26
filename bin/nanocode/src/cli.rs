@@ -35,6 +35,11 @@ pub enum Command {
     Exec(SessionArgs),
     #[command(about = "List models per harness with thinking levels and speed tiers")]
     Models,
+    #[command(about = "Save the API key of a provider configured in config.toml, prompting for it")]
+    Login {
+        #[arg(help = "Provider name, as in [providers.<name>]")]
+        provider: String,
+    },
     #[command(
         about = "Remove sandbox and review directories left behind by nanocode sessions that are no longer running"
     )]

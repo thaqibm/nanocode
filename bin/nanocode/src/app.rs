@@ -325,6 +325,7 @@ pub struct App {
     pub(crate) review: Option<crate::approval::Review>,
     pub(crate) review_dismissed: bool,
     pub(crate) pending_diff_tool: bool,
+    pub(crate) pending_login: Option<String>,
     pub(crate) preview_cache: Option<((u64, u16), Vec<nanocode_tui::ratatui::text::Line<'static>>)>,
 }
 
@@ -407,6 +408,7 @@ pub async fn run(launch: Launch, mut terminal: TerminalSession) -> Result<()> {
         review: None,
         review_dismissed: false,
         pending_diff_tool: false,
+        pending_login: None,
         preview_cache: None,
     };
     let instance = reload::Instance::start(app.tx.clone()).await?;
@@ -1899,6 +1901,9 @@ impl App {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 self.handle_key(key, terminal);
+                if let Some(name) = self.pending_login.take() {
+                    self.provider_login(&name, terminal);
+                }
                 if let Some((text, copied)) = self.pending_copy.take() {
                     match terminal.copy(&text) {
                         Ok(()) => self.flash(copied),

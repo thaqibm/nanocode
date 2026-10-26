@@ -239,6 +239,7 @@ pub struct HostConfig {
     pub computer_use: bool,
     pub diff_preview_lines: usize,
     pub auto_diff_tool: bool,
+    pub providers: std::collections::BTreeMap<String, crate::config::Provider>,
 }
 
 #[derive(Clone)]
@@ -407,8 +408,8 @@ impl Gateway {
         }
     }
 
-    pub fn provider(name: &str, provider: &crate::config::Provider) -> Result<Self> {
-        let (key, credential) = provider.key(name)?;
+    pub fn provider(name: &str, provider: &crate::config::Provider, home: &Path) -> Result<Self> {
+        let (key, credential) = provider.key(name, home)?;
         let mut gateway =
             nanocode::codex::transport::ChatGateway::openai_compatible(provider.base_url.clone());
         for entry in provider.entries() {

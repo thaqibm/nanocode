@@ -8,6 +8,7 @@ mod batch;
 mod cli;
 mod commands;
 mod config;
+mod credentials;
 #[cfg(unix)]
 mod cua;
 mod events;
@@ -163,6 +164,7 @@ pub fn run_with(clients: ModelClients) -> ExitCode {
             }
             Some(Command::Exec(args)) => exec(args.or(cli.session), clients).await,
             Some(Command::Clean) => clean(&home),
+            Some(Command::Login { provider }) => login_provider(&home, &provider),
             Some(Command::Models) => {
                 print_models();
                 Ok(())
@@ -215,6 +217,10 @@ async fn prepare(
             .then(|| config.model.clone())
             .flatten()
     });
+    let codex_requested = args.harness == Some(HarnessArg::Codex)
+        || requested.as_deref().is_some_and(|model| {
+            host::parse_model(model).is_ok_and(|model| model.as_codex().is_some())
+        });
     let gateway = match (
         host::gateway(&args.gateway)?,
         requested
@@ -222,8 +228,14 @@ async fn prepare(
             .and_then(|model| config.provider_for(model)),
     ) {
         (Some(gateway), _) => Some(gateway),
-        (None, Some((name, provider))) => Some(host::Gateway::provider(name, provider)?),
-        (None, None) => None,
+        (None, Some((name, provider))) => Some(host::Gateway::provider(name, provider, &home)?),
+        (None, None) if codex_requested || clients.supplies_openai() => None,
+        (None, None) => config
+            .providers
+            .iter()
+            .find(|(name, provider)| provider.key(name, &home).is_ok())
+            .map(|(name, provider)| host::Gateway::provider(name, provider, &home))
+            .transpose()?,
     };
     if gateway.is_some() && clients.supplies_openai() {
         return Err("this binary supplies its own Codex client; --gateway is unavailable".into());
@@ -300,6 +312,7 @@ async fn prepare(
         computer_use: args.computer_use || config.computer_use,
         diff_preview_lines: config.diff_preview_lines.unwrap_or(DIFF_PREVIEW_LINES),
         auto_diff_tool: config.auto_diff_tool,
+        providers: config.providers.clone(),
     };
     let config = host_config;
     let host = tracing::Instrument::instrument(
@@ -360,6 +373,7 @@ async fn interactive(mut args: SessionArgs, clients: ModelClients) -> Result<()>
                 .into(),
         );
     }
+    ensure_provider_key(&args)?;
     let terminal =
         nanocode_tui::terminal::TerminalSession::enter(nanocode_tui::terminal::TerminalOptions {
             mouse_capture: !args.no_mouse,
@@ -445,6 +459,7 @@ async fn exec(args: SessionArgs, clients: ModelClients) -> Result<()> {
         .clone()
         .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("exec requires a prompt")?;
+    ensure_provider_key(&args)?;
     let prepared = prepare(
         &args,
         clients,
@@ -701,4 +716,23 @@ fn clean(home: &Path) -> Result<()> {
         return Err("some directories could not be removed".into());
     }
     Ok(())
+}
+
+fn login_provider(home: &Path, provider: &str) -> Result<()> {
+    let config = config::Config::load(home)?;
+    let path = credentials::login(&config, home, provider)?;
+    println!("saved the {provider} key to {}", path.display());
+    Ok(())
+}
+
+fn ensure_provider_key(args: &SessionArgs) -> Result<()> {
+    let home = host::home_dir(args.home.as_deref())?;
+    let config = config::Config::load(&home)?;
+    let model = args.model.clone().or_else(|| {
+        args.harness
+            .is_none()
+            .then(|| config.model.clone())
+            .flatten()
+    });
+    credentials::ensure_key(&config, &home, model.as_deref())
 }

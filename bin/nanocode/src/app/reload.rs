@@ -114,7 +114,7 @@ impl App {
         }
     }
 
-    pub(super) fn request_reload(&mut self, broadcast: bool) {
+    pub(crate) fn request_reload(&mut self, broadcast: bool) {
         if !cfg!(unix) {
             self.notice(
                 NoticeLevel::Error,
